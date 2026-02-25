@@ -7,6 +7,11 @@ import { MCPServersConfig } from "../types/config.types.js";
 import { MCPServerError } from "../types/v2.types.js";
 import { MCPStatus, MCPServerStatus } from "../types/mcp.types.js";
 
+export interface MCPServerSetupOptions {
+  /** Additional tools to block (e.g., for report mode) */
+  additionalBlockedTools?: string[];
+}
+
 export class MCPServerManager {
   // MCP servers are managed entirely by NeuroLink
   // No need to track tools locally
@@ -19,15 +24,27 @@ export class MCPServerManager {
   async setupMCPServers(
     neurolink: any,
     config: MCPServersConfig,
+    options?: MCPServerSetupOptions,
   ): Promise<void> {
     console.log("🔌 Setting up MCP servers...");
 
+    // Merge additional blocked tools with config blocked tools
+    const additionalBlocked = options?.additionalBlockedTools || [];
+
     // Setup Bitbucket MCP (always enabled)
-    await this.setupBitbucketMCP(neurolink, config.bitbucket?.blockedTools);
+    await this.setupBitbucketMCP(
+      neurolink,
+      config.bitbucket?.blockedTools,
+      additionalBlocked,
+    );
 
     // Setup Jira MCP (optional)
     if (config.jira.enabled) {
-      await this.setupJiraMCP(neurolink, config.jira.blockedTools);
+      await this.setupJiraMCP(
+        neurolink,
+        config.jira.blockedTools,
+        additionalBlocked,
+      );
     } else {
       console.log("   ⏭️  Jira MCP disabled in config");
     }
@@ -41,7 +58,8 @@ export class MCPServerManager {
    */
   private async setupBitbucketMCP(
     neurolink: any,
-    blockedTools?: string[],
+    configBlockedTools?: string[],
+    additionalBlockedTools: string[] = [],
   ): Promise<void> {
     try {
       console.log("   🔧 Registering Bitbucket MCP server...");
@@ -57,6 +75,12 @@ export class MCPServerManager {
         );
       }
 
+      // Merge blocked tools from config and additional (e.g., report mode)
+      const blockedTools = this.mergeBlockedTools(
+        configBlockedTools,
+        additionalBlockedTools,
+      );
+
       // Hardcoded Bitbucket MCP configuration
       await neurolink.addExternalMCPServer("bitbucket", {
         command: "npx",
@@ -67,11 +91,11 @@ export class MCPServerManager {
           BITBUCKET_TOKEN: process.env.BITBUCKET_TOKEN,
           BITBUCKET_BASE_URL: process.env.BITBUCKET_BASE_URL,
         },
-        blockedTools: blockedTools || [],
+        blockedTools,
       });
 
       console.log("   ✅ Bitbucket MCP server registered and tools available");
-      if (blockedTools && blockedTools.length > 0) {
+      if (blockedTools.length > 0) {
         console.log(`   🚫 Blocked tools: ${blockedTools.join(", ")}`);
       }
     } catch (error) {
@@ -86,7 +110,8 @@ export class MCPServerManager {
    */
   private async setupJiraMCP(
     neurolink: any,
-    blockedTools?: string[],
+    configBlockedTools?: string[],
+    additionalBlockedTools: string[] = [],
   ): Promise<void> {
     try {
       console.log("   🔧 Registering Jira MCP server...");
@@ -104,6 +129,12 @@ export class MCPServerManager {
         return;
       }
 
+      // Merge blocked tools from config and additional (e.g., report mode)
+      const blockedTools = this.mergeBlockedTools(
+        configBlockedTools,
+        additionalBlockedTools,
+      );
+
       // Hardcoded Jira MCP configuration
       await neurolink.addExternalMCPServer("jira", {
         command: "npx",
@@ -114,11 +145,11 @@ export class MCPServerManager {
           JIRA_API_TOKEN: process.env.JIRA_API_TOKEN,
           JIRA_BASE_URL: process.env.JIRA_BASE_URL,
         },
-        blockedTools: blockedTools || [],
+        blockedTools,
       });
 
       console.log("   ✅ Jira MCP server registered and tools available");
-      if (blockedTools && blockedTools.length > 0) {
+      if (blockedTools.length > 0) {
         console.log(`   🚫 Blocked tools: ${blockedTools.join(", ")}`);
       }
     } catch (error) {
@@ -128,5 +159,24 @@ export class MCPServerManager {
       );
       console.warn("   Continuing without Jira integration...");
     }
+  }
+
+  /**
+   * Merge blocked tools from config and additional sources
+   * Deduplicates and returns combined array
+   */
+  private mergeBlockedTools(
+    configBlocked?: string[],
+    additionalBlocked: string[] = [],
+  ): string[] {
+    const combined = new Set<string>();
+
+    if (configBlocked) {
+      configBlocked.forEach((tool) => combined.add(tool));
+    }
+
+    additionalBlocked.forEach((tool) => combined.add(tool));
+
+    return Array.from(combined);
   }
 }

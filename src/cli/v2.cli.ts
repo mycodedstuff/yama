@@ -66,6 +66,12 @@ function setupReviewCommand(): void {
     .option("-p, --pr <id>", "Pull request ID")
     .option("-b, --branch <branch>", "Branch name (finds PR automatically)")
     .option("--review-only", "Skip description enhancement, only review code")
+    .option("--report", "Generate report file instead of posting comments")
+    .option("--report-format <format>", "Report format (md|json)", "md")
+    .option(
+      "--report-path <path>",
+      "Report output path (use '-' for stdout, default: .yama/reports/pr-{id}-{timestamp}.md)",
+    )
     .action(async (options) => {
       try {
         const globalOpts = program.opts();
@@ -88,6 +94,17 @@ function setupReviewCommand(): void {
           }
         }
 
+        // Validate report format
+        if (
+          options.reportFormat &&
+          !["md", "json"].includes(options.reportFormat)
+        ) {
+          console.error(
+            `❌ Error: Invalid report format "${options.reportFormat}" (must be md or json)`,
+          );
+          process.exit(1);
+        }
+
         const request: ReviewRequest = {
           workspace: options.workspace,
           repository: options.repository,
@@ -96,17 +113,28 @@ function setupReviewCommand(): void {
           dryRun: globalOpts.dryRun || false,
           verbose: globalOpts.verbose || false,
           configPath: globalOpts.config,
+          reportMode: options.report || false,
+          reportFormat: options.reportFormat || "md",
+          reportPath: options.reportPath,
+          reviewOnly: options.reviewOnly || false,
         };
 
         // Create orchestrator
         const yama = createYamaV2();
 
-        // Initialize
-        await yama.initialize(request.configPath);
+        // Initialize with report mode option
+        await yama.initialize(request.configPath, {
+          reportMode: request.reportMode,
+        });
 
         // Start review (with or without description enhancement)
         console.log("🚀 Starting autonomous AI review...\n");
 
+        // Decision logic:
+        // --review-only: Skip enhancement entirely (call startReview)
+        // --report only: Run enhancement but output to report (call startReviewAndEnhance)
+        // --report --review-only: Report without enhancement (call startReview)
+        // Neither: Normal mode with PR update (call startReviewAndEnhance)
         const result = options.reviewOnly
           ? await yama.startReview(request)
           : await yama.startReviewAndEnhance(request);
@@ -115,15 +143,19 @@ function setupReviewCommand(): void {
         console.log("\n📊 Review Results:");
         console.log(`   Decision: ${result.decision}`);
         console.log(`   Files Reviewed: ${result.statistics.filesReviewed}`);
-        console.log(
-          `   Total Comments: ${result.totalComments || result.statistics.totalComments || 0}`,
-        );
+        if (result.reportPath) {
+          console.log(`   Report: ${result.reportPath}`);
+        } else {
+          console.log(
+            `   Total Comments: ${result.totalComments || result.statistics.totalComments || 0}`,
+          );
+        }
         if (result.descriptionEnhanced !== undefined) {
           console.log(
             `   Description Enhanced: ${result.descriptionEnhanced ? "✅ Yes" : "⏭️  Skipped"}`,
           );
         }
-        console.log(`   Duration: ${Math.round(result.duration / 1000)}s`);
+        console.log(`   Duration: ${result.duration}s`);
         console.log(
           `   Token Usage: ${result.tokenUsage.total.toLocaleString()} tokens`,
         );

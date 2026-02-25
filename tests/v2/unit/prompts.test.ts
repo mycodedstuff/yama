@@ -326,4 +326,68 @@ describe("PromptBuilder", () => {
       expect(result).toContain("<workspace>test-workspace</workspace>");
     });
   });
+
+  describe("buildReviewInstructions - Report Mode", () => {
+    it("should use report mode system prompt when reportMode is true", async () => {
+      mockRequest.reportMode = true;
+      mockRequest.reportFormat = "md";
+      const result = await builder.buildReviewInstructions(
+        mockRequest,
+        mockConfig,
+      );
+
+      // Should contain the report mode system prompt, not the regular review prompt
+      expect(result).toContain("<yama-report-system>");
+      expect(result).toContain("REPORT MODE");
+      expect(result).toContain("<blocked-tools>");
+      expect(result).toContain("<report-format>");
+    });
+
+    it("should mark add_comment as blocked in report mode", async () => {
+      mockRequest.reportMode = true;
+      const result = await builder.buildReviewInstructions(
+        mockRequest,
+        mockConfig,
+      );
+
+      // Should contain blocked-tools section marking these tools as not available
+      expect(result).toContain("<blocked-tools>");
+      expect(result).toContain(
+        '<tool name="add_comment">NOT AVAILABLE in report mode</tool>',
+      );
+      expect(result).toContain(
+        '<tool name="approve_pull_request">NOT AVAILABLE in report mode</tool>',
+      );
+      expect(result).toContain(
+        '<tool name="request_changes">NOT AVAILABLE in report mode</tool>',
+      );
+    });
+
+    it("should include report output format instructions in report mode", async () => {
+      mockRequest.reportMode = true;
+      mockRequest.reportFormat = "md";
+      const result = await builder.buildReviewInstructions(
+        mockRequest,
+        mockConfig,
+      );
+
+      // Should contain report format instructions
+      expect(result).toContain("# Code Review Report");
+      expect(result).toContain("## Issues Found");
+    });
+
+    it("should include JSON format instructions when reportFormat is json", async () => {
+      mockRequest.reportMode = true;
+      mockRequest.reportFormat = "json";
+      const result = await builder.buildReviewInstructions(
+        mockRequest,
+        mockConfig,
+      );
+
+      // Should contain JSON-specific format instructions
+      expect(result).toContain("```json");
+      expect(result).toContain('"decision"');
+      expect(result).toContain('"issues"');
+    });
+  });
 });

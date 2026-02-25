@@ -13,6 +13,10 @@ import { YamaV2Config } from "../types/config.types.js";
 import { ReviewRequest } from "../types/v2.types.js";
 import { LangfusePromptManager } from "./LangfusePromptManager.js";
 import { KnowledgeBaseManager } from "../learning/KnowledgeBaseManager.js";
+import {
+  getReportModeSystemPrompt,
+  getReportModeEnhancementPrompt,
+} from "./ReportModeSystemPrompt.js";
 
 export class PromptBuilder {
   private langfuseManager: LangfusePromptManager;
@@ -24,13 +28,17 @@ export class PromptBuilder {
   /**
    * Build complete review instructions for AI
    * Combines generic base prompt + project-specific config
+   * In report mode, uses a dedicated system prompt that outputs a report instead of posting comments
    */
   async buildReviewInstructions(
     request: ReviewRequest,
     config: YamaV2Config,
   ): Promise<string> {
-    // Base system prompt - fetched from Langfuse or local fallback
-    const basePrompt = await this.langfuseManager.getReviewPrompt();
+    // Use dedicated report mode system prompt when in report mode
+    // This replaces the base prompt entirely to avoid conflicting instructions
+    const basePrompt = request.reportMode
+      ? getReportModeSystemPrompt(request.reportFormat)
+      : await this.langfuseManager.getReviewPrompt();
 
     // Project-specific configuration in XML format
     const projectConfig = this.buildProjectConfigXML(config, request);
@@ -42,7 +50,7 @@ export class PromptBuilder {
     const knowledgeBase = await this.loadKnowledgeBase(config);
 
     // Combine all parts
-    return `
+    const instructions = `
 ${basePrompt}
 
 <project-configuration>
@@ -61,20 +69,12 @@ ${knowledgeBase ? `<learned-knowledge>\n${knowledgeBase}\n</learned-knowledge>` 
   <mode>${request.dryRun ? "dry-run" : "live"}</mode>
 
   <instructions>
-    Begin your autonomous code review now.
-
-    1. Call get_pull_request() to read PR details and existing comments
-    2. Analyze files one by one using get_pull_request_diff()
-    3. Use search_code() BEFORE commenting on unfamiliar code
-    4. Post comments immediately with add_comment() using line_number and line_type from diff
-    5. Apply blocking criteria to make final decision
-    6. Call approve_pull_request() or request_changes()
-    7. Post summary comment with statistics
-
-    ${request.dryRun ? "DRY RUN MODE: Simulate actions only, do not post real comments." : "LIVE MODE: Post real comments and make real decisions."}
+    ${this.buildTaskInstructions(request)}
   </instructions>
 </review-task>
     `.trim();
+
+    return instructions;
   }
 
   /**
@@ -139,6 +139,41 @@ ${excludePatternsXML}
     <context-lines>${config.review.contextLines}</context-lines>
     <max-files-per-review>${config.review.maxFilesPerReview}</max-files-per-review>
   </context-settings>
+    `.trim();
+  }
+
+  /**
+   * Build task instructions based on mode
+   */
+  private buildTaskInstructions(request: ReviewRequest): string {
+    if (request.reportMode) {
+      // Report mode: analyze and output report, don't post comments
+      return `
+Begin your autonomous code review now.
+
+1. Call get_pull_request() to read PR details
+2. Analyze files one by one using get_pull_request_diff()
+3. Use search_code() to understand context when needed
+4. Track all issues found during analysis
+5. After ALL files analyzed, output the complete report following the format in your system instructions
+
+${request.dryRun ? "DRY RUN MODE: Simulate actions only, do not post real comments." : "LIVE MODE: Analyze files and generate report."}
+      `.trim();
+    }
+
+    // Normal mode: post comments and make decisions
+    return `
+Begin your autonomous code review now.
+
+1. Call get_pull_request() to read PR details and existing comments
+2. Analyze files one by one using get_pull_request_diff()
+3. Use search_code() BEFORE commenting on unfamiliar code
+4. Post comments immediately with add_comment() using line_number and line_type from diff
+5. Apply blocking criteria to make final decision
+6. Call approve_pull_request() or request_changes()
+7. Post summary comment with statistics
+
+${request.dryRun ? "DRY RUN MODE: Simulate actions only, do not post real comments." : "LIVE MODE: Post real comments and make real decisions."}
     `.trim();
   }
 
@@ -226,16 +261,26 @@ ${loadedStandards.join("\n\n---\n\n")}
 
   /**
    * Build description enhancement prompt separately (for description-only operations)
+   * In report mode, uses a dedicated prompt that outputs description directly
+   * instead of calling update_pull_request (which is blocked)
    */
   async buildDescriptionEnhancementInstructions(
     request: ReviewRequest,
     config: YamaV2Config,
   ): Promise<string> {
-    // Base enhancement prompt - fetched from Langfuse or local fallback
-    const basePrompt = await this.langfuseManager.getEnhancementPrompt();
+    // Use report-mode enhancement prompt when in report mode
+    // This avoids instructing the AI to call update_pull_request (which is blocked)
+    const basePrompt = request.reportMode
+      ? getReportModeEnhancementPrompt()
+      : await this.langfuseManager.getEnhancementPrompt();
 
     // Project-specific enhancement configuration
     const enhancementConfigXML = this.buildEnhancementConfigXML(config);
+
+    // Build task instructions based on mode
+    const taskInstructions = request.reportMode
+      ? this.buildReportModeEnhancementTaskInstructions(request)
+      : this.buildNormalModeEnhancementTaskInstructions(request);
 
     return `
 ${basePrompt}
@@ -252,6 +297,20 @@ ${enhancementConfigXML}
   <mode>${request.dryRun ? "dry-run" : "live"}</mode>
 
   <instructions>
+${taskInstructions}
+  </instructions>
+</enhancement-task>
+    `.trim();
+  }
+
+  /**
+   * Build task instructions for normal mode enhancement
+   * AI will call update_pull_request() to update the PR
+   */
+  private buildNormalModeEnhancementTaskInstructions(
+    request: ReviewRequest,
+  ): string {
+    return `
     Enhance the PR description now.
 
     1. Call get_pull_request() to read current PR and description
@@ -266,8 +325,32 @@ ${enhancementConfigXML}
     Start directly with section content.
 
     ${request.dryRun ? "DRY RUN MODE: Simulate only, do not actually update PR." : "LIVE MODE: Update the actual PR description."}
-  </instructions>
-</enhancement-task>
+    `.trim();
+  }
+
+  /**
+   * Build task instructions for report mode enhancement
+   * AI outputs description directly (update_pull_request is blocked)
+   */
+  private buildReportModeEnhancementTaskInstructions(
+    request: ReviewRequest,
+  ): string {
+    return `
+    Enhance the PR description now.
+
+    1. Call get_pull_request() to read current PR and description
+    2. Call get_pull_request_diff() to analyze code changes
+    3. Use search_code() to find configuration patterns, API changes
+    4. Extract information for each required section
+    5. Build enhanced description following section structure
+    6. OUTPUT THE DESCRIPTION DIRECTLY - DO NOT call update_pull_request()
+
+    CRITICAL: Output the enhanced description as plain markdown.
+    DO NOT wrap in code blocks.
+    DO NOT call update_pull_request() - it is BLOCKED in report mode.
+    The description will be captured and appended to the review report.
+
+    ${request.dryRun ? "DRY RUN MODE: Simulate only." : "LIVE MODE: Description will be added to report file."}
     `.trim();
   }
 

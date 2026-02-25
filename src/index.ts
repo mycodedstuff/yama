@@ -15,6 +15,10 @@ export { ConfigLoader } from "./v2/config/ConfigLoader.js";
 export { MCPServerManager } from "./v2/core/MCPServerManager.js";
 export { SessionManager } from "./v2/core/SessionManager.js";
 export { PromptBuilder } from "./v2/prompts/PromptBuilder.js";
+export {
+  ReportGenerator,
+  createReportGenerator,
+} from "./v2/report/ReportGenerator.js";
 
 // ============================================================================
 // Type Exports
@@ -44,6 +48,19 @@ export type {
   GetIssueResponse,
   SearchCodeResponse,
 } from "./v2/types/mcp.types.js";
+
+// Report types
+export type {
+  ReportFormat,
+  IssueSeverity,
+  LineType,
+  ReviewIssue,
+  ReviewDecision,
+  IssueStatistics,
+  ReviewReportStatistics,
+  ReviewReport,
+  AIReportOutput,
+} from "./v2/types/report.types.js";
 
 // ============================================================================
 // Version Information

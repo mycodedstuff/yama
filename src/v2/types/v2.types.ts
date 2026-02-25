@@ -15,6 +15,12 @@ export interface ReviewRequest {
   dryRun?: boolean;
   verbose?: boolean;
   configPath?: string;
+  // Report mode options
+  reportMode?: boolean;
+  reportFormat?: "md" | "json";
+  reportPath?: string;
+  // Review-only mode: skip description enhancement entirely
+  reviewOnly?: boolean;
 }
 
 export interface ReviewResult {
@@ -28,6 +34,10 @@ export interface ReviewResult {
   sessionId: string;
   descriptionEnhanced?: boolean;
   totalComments?: number;
+  // Report mode output
+  reportPath?: string;
+  // Enhanced description content (for report mode)
+  enhancedDescription?: string;
 }
 
 export interface ReviewStatistics {
