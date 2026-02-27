@@ -477,8 +477,12 @@ function setupMigrateCommand(): void {
     });
 }
 
-// Only run if this is the main module
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Only run if this is the main module (handles npm link symlinks correctly)
+import { realpathSync } from "fs";
+import { pathToFileURL } from "url";
+
+const resolvedMain = realpathSync(process.argv[1]);
+if (import.meta.url === pathToFileURL(resolvedMain).href) {
   const cli = setupV2CLI();
   cli.parse(process.argv);
 }
