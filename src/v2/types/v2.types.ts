@@ -64,6 +64,24 @@ export interface TokenUsage {
 }
 
 // ============================================================================
+// PR Display Types
+// ============================================================================
+
+export interface PRDisplayInfo {
+  id: number;
+  title: string;
+  author: {
+    name: string;
+    displayName: string;
+  };
+  state: "OPEN" | "MERGED" | "DECLINED";
+  sourceBranch: string;
+  destinationBranch: string;
+  createdDate: string;
+  updatedDate: string;
+}
+
+// ============================================================================
 // Streaming Types
 // ============================================================================
 

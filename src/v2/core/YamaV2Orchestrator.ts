@@ -20,7 +20,9 @@ import {
   YamaV2Error,
   ReviewStatistics,
   IssuesBySeverity,
+  PRDisplayInfo,
 } from "../types/v2.types.js";
+import { GetPullRequestResponse } from "../types/mcp.types.js";
 import { YamaV2Config } from "../types/config.types.js";
 import {
   buildObservabilityConfigFromEnv,
@@ -111,6 +113,22 @@ export class YamaV2Orchestrator {
    */
   async startReview(request: ReviewRequest): Promise<ReviewResult> {
     await this.ensureInitialized(request.reportMode);
+
+    // Fetch and display PR info before review starts
+    const prInfo = await this.fetchPRInfo(request);
+    if (prInfo) {
+      this.displayPRInfo(prInfo);
+      // Update request with resolved PR ID if it was found from branch
+      if (!request.pullRequestId && prInfo.id) {
+        request.pullRequestId = prInfo.id;
+      }
+    } else {
+      // Inform user that PR info couldn't be fetched
+      console.log("⚠️  Could not fetch PR information before review starts.");
+      console.log(
+        "   The AI will attempt to resolve PR details during the review.\n",
+      );
+    }
 
     const startTime = Date.now();
     const sessionId = this.sessionManager.createSession(request);
@@ -261,6 +279,22 @@ export class YamaV2Orchestrator {
    */
   async startReviewAndEnhance(request: ReviewRequest): Promise<ReviewResult> {
     await this.ensureInitialized(request.reportMode);
+
+    // Fetch and display PR info before review starts
+    const prInfo = await this.fetchPRInfo(request);
+    if (prInfo) {
+      this.displayPRInfo(prInfo);
+      // Update request with resolved PR ID if it was found from branch
+      if (!request.pullRequestId && prInfo.id) {
+        request.pullRequestId = prInfo.id;
+      }
+    } else {
+      // Inform user that PR info couldn't be fetched
+      console.log("⚠️  Could not fetch PR information before review starts.");
+      console.log(
+        "   The AI will attempt to resolve PR details during the review.\n",
+      );
+    }
 
     const startTime = Date.now();
     const sessionId = this.sessionManager.createSession(request);
@@ -1055,6 +1089,305 @@ export class YamaV2Orchestrator {
       console.log(
         `   ⚠️  Failed to append enhanced description to report: ${(error as Error).message}`,
       );
+    }
+  }
+
+  // ============================================================================
+  // PR Info Fetching & Display Methods
+  // ============================================================================
+
+  /**
+   * Fetch PR information before AI review starts
+   * Uses MCP tools directly via NeuroLink's executeTool method
+   *
+   * TODO: Replace MCP server calls with direct Bitbucket API integration
+   * The MCP server adds unnecessary overhead (protocol wrapping, subprocess spawning)
+   * Direct integration would use axios to call Bitbucket REST API endpoints directly:
+   * - GET /rest/api/1.0/projects/{workspace}/repos/{repo}/pull-requests/{id}
+   * - GET /rest/api/1.0/projects/{workspace}/repos/{repo}/pull-requests (for branch lookup)
+   * This would eliminate the need for unwrapMCPResponse() and mapToPRDisplayInfo() format handling.
+   */
+  private async fetchPRInfo(
+    request: ReviewRequest,
+  ): Promise<PRDisplayInfo | null> {
+    try {
+      if (request.pullRequestId) {
+        // Direct PR ID - use get_pull_request MCP tool
+        const result = await this.neurolink.executeTool<any>(
+          "get_pull_request",
+          {
+            workspace: request.workspace,
+            repository: request.repository,
+            pull_request_id: request.pullRequestId,
+          },
+        );
+
+        // Unwrap MCP response format: { content: [{ type: "text", text: "...json..." }] }
+        const prData = this.unwrapMCPResponse(result);
+        if (!prData) {
+          console.log("   ⚠️  Could not parse MCP response for PR info");
+          return null;
+        }
+
+        return this.mapToPRDisplayInfo(prData);
+      }
+
+      if (request.branch) {
+        // Branch name - use list_pull_requests MCP tool and filter
+        return await this.fetchPRByBranch(request);
+      }
+
+      return null;
+    } catch (error) {
+      console.log(
+        `   ⚠️  Could not fetch PR info: ${(error as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Unwrap MCP protocol response format
+   * MCP returns: { content: [{ type: "text", text: "...json..." }] }
+   * This extracts and parses the JSON from the text field
+   *
+   * TODO: Remove this method when migrating to direct Bitbucket API integration.
+   * Direct REST API calls will return JSON directly without MCP protocol wrapping.
+   */
+  private unwrapMCPResponse(response: any): any | null {
+    // Check if response is in MCP format
+    if (
+      response?.content &&
+      Array.isArray(response.content) &&
+      response.content.length > 0
+    ) {
+      const contentItem = response.content[0];
+      if (
+        contentItem?.type === "text" &&
+        typeof contentItem.text === "string"
+      ) {
+        try {
+          return JSON.parse(contentItem.text);
+        } catch {
+          // If parsing fails, return the text as-is
+          return contentItem.text;
+        }
+      }
+    }
+
+    // If not in MCP format, return as-is (backward compatibility)
+    return response;
+  }
+
+  /**
+   * Fetch PR by branch name using list_pull_requests MCP tool
+   * Handles pagination to search through all open PRs
+   */
+  private async fetchPRByBranch(
+    request: ReviewRequest,
+  ): Promise<PRDisplayInfo | null> {
+    console.log(`🔍 Searching for PR from branch: ${request.branch}`);
+
+    const pageSize = 50;
+    let start = 0;
+    let totalSearched = 0;
+    let pageCount = 0;
+
+    while (true) {
+      pageCount++;
+
+      // Show pagination progress for subsequent pages
+      if (pageCount > 1) {
+        console.log(
+          `   📄 Fetching page ${pageCount} (searched ${totalSearched} PRs so far)...`,
+        );
+      }
+
+      // Use list_pull_requests MCP tool with pagination
+      const rawResult = await this.neurolink.executeTool<any>(
+        "list_pull_requests",
+        {
+          workspace: request.workspace,
+          repository: request.repository,
+          state: "OPEN",
+          limit: pageSize,
+          start: start,
+        },
+      );
+
+      // Unwrap MCP response format
+      const result = this.unwrapMCPResponse(rawResult) as {
+        values: any[];
+        isLastPage?: boolean;
+      } | null;
+
+      if (!result?.values || result.values.length === 0) {
+        // No more PRs to search
+        break;
+      }
+
+      totalSearched += result.values.length;
+
+      // Find PR with matching source branch
+      // Note: Branch name could be displayId (feature/auth) or id (refs/heads/feature/auth)
+      // Also handle MCP flattened format (source_branch) vs raw API (fromRef.displayId)
+      const matchingPR = result.values.find((pr: any) => {
+        const sourceBranch =
+          pr.source_branch ||
+          pr.fromRef?.displayId ||
+          pr.fromRef?.id ||
+          pr.source?.branch?.name ||
+          "";
+        const branchName = request.branch || "";
+        // Match either displayId or full ref path
+        return (
+          sourceBranch === branchName ||
+          sourceBranch === `refs/heads/${branchName}` ||
+          `refs/heads/${sourceBranch}` === branchName
+        );
+      });
+
+      if (matchingPR) {
+        console.log(
+          `   ✅ Found PR #${matchingPR.id} after searching ${totalSearched} PRs\n`,
+        );
+        // Use mapToPRDisplayInfo for consistent handling of MCP format
+        return this.mapToPRDisplayInfo(matchingPR);
+      }
+
+      // Check if there are more pages
+      if (result.isLastPage === false || result.values.length === pageSize) {
+        start += pageSize;
+      } else {
+        // No more pages
+        break;
+      }
+    }
+
+    throw new Error(
+      `No open PR found for branch: ${request.branch} (searched ${totalSearched} PRs)`,
+    );
+  }
+
+  /**
+   * Map MCP server response to PRDisplayInfo
+   * MCP server returns a flattened format with different field names than raw Bitbucket API
+   */
+  private mapToPRDisplayInfo(pr: any): PRDisplayInfo {
+    // MCP server returns flattened structure: source_branch, destination_branch
+    // Also handle raw API formats for backward compatibility
+    const sourceBranch =
+      pr.source_branch ||
+      pr.fromRef?.displayId ||
+      pr.source?.branch?.name ||
+      "unknown";
+    const destinationBranch =
+      pr.destination_branch ||
+      pr.toRef?.displayId ||
+      pr.destination?.branch?.name ||
+      "unknown";
+
+    // Author can be string (MCP formatted) or object (raw API)
+    let authorName = "Unknown";
+    let authorUsername = "unknown";
+
+    if (typeof pr.author === "string") {
+      // MCP formatted response
+      authorName = pr.author;
+      authorUsername = pr.author_username || pr.author;
+    } else if (pr.author) {
+      // Raw API format (Server or Cloud)
+      const authorObj = pr.author.user || pr.author;
+      authorName = authorObj.displayName || authorObj.display_name || "Unknown";
+      authorUsername = authorObj.name || "unknown";
+    }
+
+    return {
+      id: pr.id,
+      title: pr.title,
+      author: {
+        name: authorUsername,
+        displayName: authorName,
+      },
+      state: pr.state,
+      sourceBranch,
+      destinationBranch,
+      createdDate: pr.created_on || pr.createdDate,
+      updatedDate: pr.updated_on || pr.updatedDate,
+    };
+  }
+
+  /**
+   * Display PR information to the console
+   */
+  private displayPRInfo(prInfo: PRDisplayInfo): void {
+    console.log("\n" + "─".repeat(60));
+    console.log(`📋 Pull Request Information`);
+    console.log("─".repeat(60));
+    console.log(`   PR #${prInfo.id}: ${prInfo.title}`);
+    console.log(
+      `   Author: ${prInfo.author.displayName} (@${prInfo.author.name})`,
+    );
+    console.log(`   State: ${this.formatPRState(prInfo.state)}`);
+    console.log(
+      `   Branch: ${prInfo.sourceBranch} → ${prInfo.destinationBranch}`,
+    );
+    console.log(`   Created: ${this.formatDate(prInfo.createdDate)}`);
+    console.log(`   Updated: ${this.formatDate(prInfo.updatedDate)}`);
+    console.log("─".repeat(60) + "\n");
+  }
+
+  /**
+   * Format PR state with emoji
+   */
+  private formatPRState(state: string): string {
+    switch (state) {
+      case "OPEN":
+        return "🟢 OPEN";
+      case "MERGED":
+        return "🟣 MERGED";
+      case "DECLINED":
+        return "🔴 DECLINED";
+      default:
+        return state;
+    }
+  }
+
+  /**
+   * Format date string to human-readable format
+   */
+  private formatDate(dateString: string): string {
+    try {
+      let date: Date;
+
+      // Check if date is in MCP format: "22/01/2026, 12:16:32" (DD/MM/YYYY, HH:mm:ss)
+      const mcpDateMatch = dateString.match(
+        /^(\d{2})\/(\d{2})\/(\d{4}),?\s+(\d{2}):(\d{2}):(\d{2})$/,
+      );
+      if (mcpDateMatch) {
+        const [, day, month, year, hour, minute, second] = mcpDateMatch;
+        // Parse as DD/MM/YYYY
+        date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+      } else {
+        // Try standard ISO format
+        date = new Date(dateString);
+      }
+
+      // Check for invalid date
+      if (isNaN(date.getTime())) {
+        return dateString;
+      }
+
+      return date.toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: true,
+      });
+    } catch {
+      return dateString;
     }
   }
 }
