@@ -22,7 +22,21 @@ import {
   IssuesBySeverity,
   PRDisplayInfo,
 } from "../types/v2.types.js";
-import { GetPullRequestResponse } from "../types/mcp.types.js";
+import {
+  GetPullRequestResponse,
+  DiffFile,
+  DiffHunk,
+} from "../types/mcp.types.js";
+import {
+  FileReviewContext,
+  FileReviewResult,
+  ReviewIssue,
+  ReviewDecision,
+  PrefetchedPRData,
+} from "../types/explicit-loop.types.js";
+import { FileListFetcher } from "./FileListFetcher.js";
+import { SessionKnowledgeBaseManager } from "./SessionKnowledgeBaseManager.js";
+import { FeatureContextBuilder } from "./FeatureContextBuilder.js";
 import { YamaV2Config } from "../types/config.types.js";
 import {
   buildObservabilityConfigFromEnv,
@@ -38,6 +52,7 @@ export class YamaV2Orchestrator {
   private promptBuilder: PromptBuilder;
   private sessionManager: SessionManager;
   private reportGenerator: ReportGenerator;
+  private fileListFetcher: FileListFetcher;
   private config!: YamaV2Config;
   private initialized = false;
   private reportModeRequest?: boolean;
@@ -48,6 +63,7 @@ export class YamaV2Orchestrator {
     this.promptBuilder = new PromptBuilder();
     this.sessionManager = new SessionManager();
     this.reportGenerator = createReportGenerator();
+    this.fileListFetcher = new FileListFetcher();
   }
 
   /**
@@ -1389,6 +1405,1075 @@ export class YamaV2Orchestrator {
     } catch {
       return dateString;
     }
+  }
+
+  // ============================================================================
+  // Explicit Loop Architecture Methods
+  // ============================================================================
+
+  /**
+   * Start review with explicit loop architecture
+   * Each file gets its own controlled AI call with bounded context
+   */
+  async startReviewExplicitLoop(request: ReviewRequest): Promise<ReviewResult> {
+    await this.ensureInitialized(request.reportMode);
+
+    const startTime = Date.now();
+
+    // PHASE 1: Pre-fetch PR data (no AI)
+    console.log("\n📋 Phase 1: Fetching PR details...");
+
+    let prData: PrefetchedPRData;
+    try {
+      prData = await this.fileListFetcher.fetchPRDetails(
+        this.neurolink,
+        request,
+      );
+    } catch (error) {
+      console.error(
+        `   ❌ Failed to fetch PR details: ${(error as Error).message}`,
+      );
+      throw error;
+    }
+
+    // Update request with resolved PR ID if needed
+    if (!request.pullRequestId) {
+      request.pullRequestId = prData.prDetails.id;
+    }
+
+    // Display PR info
+    this.displayPRInfo({
+      id: prData.prDetails.id,
+      title: prData.prDetails.title,
+      author: prData.prDetails.author,
+      state: prData.prDetails.state,
+      sourceBranch: prData.prDetails.source.branch.name,
+      destinationBranch: prData.prDetails.destination.branch.name,
+      createdDate: prData.prDetails.createdDate,
+      updatedDate: prData.prDetails.updatedDate,
+    });
+
+    // Filter excluded files
+    const filesToReview = this.fileListFetcher.filterExcludedFiles(
+      prData.files,
+      this.config.review.excludePatterns,
+    );
+
+    console.log(`   ✅ Found ${filesToReview.length} files to review\n`);
+
+    if (filesToReview.length === 0) {
+      console.log(
+        "   ℹ️  No files to review after applying exclusion patterns\n",
+      );
+      return this.buildEmptyResult(startTime, request);
+    }
+
+    // PHASE 1.5: Build feature context BEFORE reviewing files
+    console.log("🎯 Building feature context...");
+    const featureContextBuilder = new FeatureContextBuilder();
+
+    // Pre-fetch all diffs for feature context analysis
+    const allDiffs = new Map<string, DiffFile>();
+    for (const file of filesToReview) {
+      const diff = await this.fileListFetcher.fetchFileDiff(
+        this.neurolink,
+        request.workspace,
+        request.repository,
+        request.pullRequestId!,
+        file.path,
+      );
+      if (diff) {
+        allDiffs.set(file.path, diff);
+      }
+    }
+
+    // Build feature context from PR details and diffs
+    const featureContext = featureContextBuilder.buildContext(
+      prData.prDetails.title,
+      prData.prDetails.description,
+      filesToReview,
+      allDiffs,
+    );
+
+    console.log(
+      `   Purpose: ${featureContext.purpose.substring(0, 80)}${featureContext.purpose.length > 80 ? "..." : ""}`,
+    );
+    console.log(
+      `   Domain: ${featureContext.domainConcepts.join(", ") || "Not identified"}`,
+    );
+    console.log(
+      `   Technical: ${featureContext.technicalApproach.substring(0, 60)}${featureContext.technicalApproach.length > 60 ? "..." : ""}\n`,
+    );
+
+    // PHASE 2: Review each file independently
+    console.log(`🔍 Phase 2: Reviewing ${filesToReview.length} files...`);
+    console.log("─".repeat(60));
+
+    // Initialize session knowledge base for deduplication and cross-file awareness
+    const sessionKB = new SessionKnowledgeBaseManager();
+
+    const fileResults: FileReviewResult[] = [];
+    let totalTokens = 0;
+
+    for (let i = 0; i < filesToReview.length; i++) {
+      const file = filesToReview[i];
+      console.log(`\n   [${i + 1}/${filesToReview.length}] ${file.path}`);
+
+      // Get pre-fetched diff
+      const diff = allDiffs.get(file.path);
+
+      if (!diff) {
+        console.log(`      ⚠️  Could not fetch diff, skipping`);
+        fileResults.push({
+          filePath: file.path,
+          issues: [],
+          toolCallsMade: 0,
+          tokensUsed: { input: 0, output: 0, total: 0 },
+          duration: 0,
+          error: "Could not fetch diff",
+        });
+        continue;
+      }
+
+      // Build context for this file
+      const context: FileReviewContext = {
+        workspace: request.workspace,
+        repository: request.repository,
+        pullRequestId: request.pullRequestId!,
+        filePath: file.path,
+        fileStatus: file.status,
+        diff,
+        existingComments: prData.existingComments.get(file.path) || [],
+        prTitle: prData.prDetails.title,
+        prDescription: prData.prDetails.description,
+        sourceBranch: prData.prDetails.source.branch.name,
+        targetBranch: prData.prDetails.destination.branch.name,
+      };
+
+      // Get KB context for this file (shows what's already been found)
+      const kbContext = sessionKB.getPromptContext();
+
+      // Format feature context for this specific file
+      const featureContextPrompt = featureContextBuilder.formatForPrompt(
+        featureContext,
+        file.path,
+      );
+
+      // Review this file with FRESH session (bounded context) + KB context + Feature context
+      const result = await this.reviewSingleFile(
+        context,
+        kbContext,
+        featureContextPrompt,
+      );
+      fileResults.push(result);
+
+      // Update KB with findings from this file for subsequent files
+      sessionKB.updateFromFileReview(result, diff);
+
+      // Display per-file results
+      totalTokens += result.tokensUsed.total;
+      this.displayFileResult(result);
+    }
+
+    console.log("\n" + "─".repeat(60));
+
+    // PHASE 3: Aggregate and decide with deduplication
+    console.log("\n📊 Phase 3: Aggregating findings...");
+    const rawIssues = this.aggregateIssues(fileResults);
+
+    // Apply post-aggregation deduplication as a safety net
+    const allIssues = sessionKB.deduplicateIssues(rawIssues);
+    const decision = this.makeFinalDecision(allIssues);
+
+    const severityCounts = this.getSeverityCounts(allIssues);
+    console.log(`   Total files reviewed: ${filesToReview.length}`);
+    console.log(`   Total issues found: ${allIssues.length}`);
+    console.log(`      🔒 CRITICAL: ${severityCounts.critical}`);
+    console.log(`      ⚠️  MAJOR: ${severityCounts.major}`);
+    console.log(`      💡 MINOR: ${severityCounts.minor}`);
+    console.log(`      💬 SUGGESTION: ${severityCounts.suggestions}`);
+    console.log(`   Total tokens used: ${totalTokens.toLocaleString()}`);
+    console.log(`   Decision: ${this.formatDecision(decision)}`);
+
+    // PHASE 4: Handle based on mode
+    let reportPath: string | undefined;
+
+    if (request.reportMode) {
+      console.log(`\n📄 Phase 4: Generating report...`);
+      const format = request.reportFormat || "md";
+      reportPath =
+        request.reportPath ||
+        this.reportGenerator.generateDefaultPath(
+          request.pullRequestId!,
+          format,
+          undefined,
+          request.repository,
+        );
+
+      const reportContent = this.reportGenerator.buildReportFromFindings({
+        prDetails: prData.prDetails,
+        filesReviewed: filesToReview,
+        allIssues,
+        decision,
+        format,
+        workspace: request.workspace,
+        repository: request.repository,
+        duration: Date.now() - startTime,
+        totalTokens,
+      });
+
+      await this.reportGenerator.writeReportFromAIResponse(
+        reportContent,
+        format,
+        reportPath,
+      );
+
+      console.log(`   Format: ${format === "md" ? "markdown" : "json"}`);
+      console.log(`   Path: ${reportPath}`);
+      console.log(`   ✅ Report written successfully`);
+    } else {
+      console.log(`\n📤 Phase 4: Posting comments...`);
+      await this.postAllComments(allIssues, request);
+      await this.postDecision(decision, request, prData.prDetails);
+      console.log(`   ✅ Comments posted to Bitbucket`);
+    }
+
+    // Build final result
+    const result: ReviewResult = {
+      prId: request.pullRequestId!,
+      decision,
+      statistics: {
+        filesReviewed: filesToReview.length,
+        issuesFound: severityCounts,
+        requirementCoverage: 0,
+        codeQualityScore: 0,
+        toolCallsMade: fileResults.reduce((sum, r) => sum + r.toolCallsMade, 0),
+        cacheHits: 0,
+        totalComments: allIssues.length,
+      },
+      summary: this.generateSummary(allIssues, decision),
+      duration: Math.round((Date.now() - startTime) / 1000),
+      tokenUsage: {
+        input: fileResults.reduce((sum, r) => sum + r.tokensUsed.input, 0),
+        output: fileResults.reduce((sum, r) => sum + r.tokensUsed.output, 0),
+        total: totalTokens,
+      },
+      costEstimate: this.calculateCostFromTokens(totalTokens),
+      sessionId: `explicit-loop-${request.pullRequestId}-${Date.now()}`,
+      reportPath,
+    };
+
+    this.logReviewComplete(result);
+
+    return result;
+  }
+
+  /**
+   * Start review and enhance with explicit loop
+   * Review uses independent loops, enhancement receives aggregated findings
+   */
+  async startReviewAndEnhanceExplicitLoop(
+    request: ReviewRequest,
+  ): Promise<ReviewResult> {
+    await this.ensureInitialized(request.reportMode);
+
+    const startTime = Date.now();
+
+    // PHASE 1: Pre-fetch PR data
+    console.log("\n📋 Phase 1: Fetching PR details...");
+
+    const prData = await this.fileListFetcher.fetchPRDetails(
+      this.neurolink,
+      request,
+    );
+
+    if (!request.pullRequestId) {
+      request.pullRequestId = prData.prDetails.id;
+    }
+
+    this.displayPRInfo({
+      id: prData.prDetails.id,
+      title: prData.prDetails.title,
+      author: prData.prDetails.author,
+      state: prData.prDetails.state,
+      sourceBranch: prData.prDetails.source.branch.name,
+      destinationBranch: prData.prDetails.destination.branch.name,
+      createdDate: prData.prDetails.createdDate,
+      updatedDate: prData.prDetails.updatedDate,
+    });
+
+    const filesToReview = this.fileListFetcher.filterExcludedFiles(
+      prData.files,
+      this.config.review.excludePatterns,
+    );
+
+    console.log(`   ✅ Found ${filesToReview.length} files to review\n`);
+
+    // PHASE 1.5: Build feature context BEFORE reviewing files
+    console.log("🎯 Building feature context...");
+    const featureContextBuilder = new FeatureContextBuilder();
+
+    // Pre-fetch all diffs for feature context analysis
+    const allDiffs = new Map<string, DiffFile>();
+    for (const file of filesToReview) {
+      const diff = await this.fileListFetcher.fetchFileDiff(
+        this.neurolink,
+        request.workspace,
+        request.repository,
+        request.pullRequestId!,
+        file.path,
+      );
+      if (diff) {
+        allDiffs.set(file.path, diff);
+      }
+    }
+
+    // Build feature context from PR details and diffs
+    const featureContext = featureContextBuilder.buildContext(
+      prData.prDetails.title,
+      prData.prDetails.description,
+      filesToReview,
+      allDiffs,
+    );
+
+    console.log(
+      `   Purpose: ${featureContext.purpose.substring(0, 80)}${featureContext.purpose.length > 80 ? "..." : ""}`,
+    );
+    console.log(
+      `   Domain: ${featureContext.domainConcepts.join(", ") || "Not identified"}`,
+    );
+    console.log(
+      `   Technical: ${featureContext.technicalApproach.substring(0, 60)}${featureContext.technicalApproach.length > 60 ? "..." : ""}\n`,
+    );
+
+    // PHASE 2: Review each file independently
+    console.log(`🔍 Phase 2: Reviewing ${filesToReview.length} files...`);
+    console.log("─".repeat(60));
+
+    // Initialize session knowledge base for deduplication and cross-file awareness
+    const sessionKB = new SessionKnowledgeBaseManager();
+
+    const fileResults: FileReviewResult[] = [];
+    let totalTokens = 0;
+
+    for (let i = 0; i < filesToReview.length; i++) {
+      const file = filesToReview[i];
+      console.log(`\n   [${i + 1}/${filesToReview.length}] ${file.path}`);
+
+      // Get pre-fetched diff
+      const diff = allDiffs.get(file.path);
+
+      if (!diff) {
+        console.log(`      ⚠️  Could not fetch diff, skipping`);
+        fileResults.push({
+          filePath: file.path,
+          issues: [],
+          toolCallsMade: 0,
+          tokensUsed: { input: 0, output: 0, total: 0 },
+          duration: 0,
+          error: "Could not fetch diff",
+        });
+        continue;
+      }
+
+      const context: FileReviewContext = {
+        workspace: request.workspace,
+        repository: request.repository,
+        pullRequestId: request.pullRequestId!,
+        filePath: file.path,
+        fileStatus: file.status,
+        diff,
+        existingComments: prData.existingComments.get(file.path) || [],
+        prTitle: prData.prDetails.title,
+        prDescription: prData.prDetails.description,
+        sourceBranch: prData.prDetails.source.branch.name,
+        targetBranch: prData.prDetails.destination.branch.name,
+      };
+
+      // Get KB context for this file (shows what's already been found)
+      const kbContext = sessionKB.getPromptContext();
+
+      // Format feature context for this specific file
+      const featureContextPrompt = featureContextBuilder.formatForPrompt(
+        featureContext,
+        file.path,
+      );
+
+      // Review this file with FRESH session (bounded context) + KB context + Feature context
+      const result = await this.reviewSingleFile(
+        context,
+        kbContext,
+        featureContextPrompt,
+      );
+      fileResults.push(result);
+
+      // Update KB with findings from this file for subsequent files
+      sessionKB.updateFromFileReview(result, diff);
+
+      totalTokens += result.tokensUsed.total;
+      this.displayFileResult(result);
+    }
+
+    console.log("\n" + "─".repeat(60));
+
+    // PHASE 3: Aggregate findings with deduplication
+    console.log("\n📊 Phase 3: Aggregating findings...");
+    const rawIssues = this.aggregateIssues(fileResults);
+
+    // Apply post-aggregation deduplication as a safety net
+    const allIssues = sessionKB.deduplicateIssues(rawIssues);
+    const decision = this.makeFinalDecision(allIssues);
+
+    const severityCounts = this.getSeverityCounts(allIssues);
+    console.log(`   Total files reviewed: ${filesToReview.length}`);
+    console.log(`   Total issues found: ${allIssues.length}`);
+    console.log(`   Decision: ${this.formatDecision(decision)}`);
+
+    // PHASE 4: Post comments or generate report
+    let reportPath: string | undefined;
+
+    if (request.reportMode) {
+      console.log(`\n📄 Phase 4: Generating report...`);
+      const format = request.reportFormat || "md";
+      reportPath =
+        request.reportPath ||
+        this.reportGenerator.generateDefaultPath(
+          request.pullRequestId!,
+          format,
+          undefined,
+          request.repository,
+        );
+
+      const reportContent = this.reportGenerator.buildReportFromFindings({
+        prDetails: prData.prDetails,
+        filesReviewed: filesToReview,
+        allIssues,
+        decision,
+        format,
+        workspace: request.workspace,
+        repository: request.repository,
+        duration: Date.now() - startTime,
+        totalTokens,
+      });
+
+      await this.reportGenerator.writeReportFromAIResponse(
+        reportContent,
+        format,
+        reportPath,
+      );
+
+      console.log(`   ✅ Report written: ${reportPath}`);
+    } else {
+      console.log(`\n📤 Phase 4: Posting comments...`);
+      await this.postAllComments(allIssues, request);
+      await this.postDecision(decision, request, prData.prDetails);
+      console.log(`   ✅ Comments posted to Bitbucket`);
+    }
+
+    // PHASE 5: Description Enhancement (if enabled and not reviewOnly)
+    let enhancedDescription: string | undefined;
+
+    if (!request.reviewOnly && this.config.descriptionEnhancement.enabled) {
+      console.log("\n📝 Phase 5: Enhancing PR description...");
+
+      const enhancePrompt =
+        this.promptBuilder.buildEnhancementPromptWithFindings({
+          prDetails: prData.prDetails,
+          filesReviewed: filesToReview,
+          issuesFound: allIssues,
+          config: this.config,
+        });
+
+      const enhanceSessionId = `${request.pullRequestId}-enhance-${Date.now()}`;
+
+      try {
+        const enhanceResponse = await this.neurolink.generate({
+          input: { text: enhancePrompt },
+          provider: this.config.ai.provider,
+          model: this.config.ai.model,
+          temperature: this.config.ai.temperature,
+          maxTokens: this.config.ai.maxTokens,
+          context: {
+            sessionId: enhanceSessionId,
+            userId: this.generateUserId(request),
+            operation: "description-enhancement",
+          },
+        });
+
+        enhancedDescription = enhanceResponse.content || "";
+
+        if (request.reportMode && reportPath && enhancedDescription) {
+          await this.reportGenerator.appendEnhancedDescription(
+            reportPath,
+            enhancedDescription,
+          );
+          console.log(`   ✅ Enhanced description appended to report`);
+        } else if (!request.reportMode && enhancedDescription) {
+          // Post the enhanced description to the PR
+          await this.neurolink.executeTool("update_pull_request", {
+            workspace: request.workspace,
+            repository: request.repository,
+            pull_request_id: request.pullRequestId,
+            description: enhancedDescription,
+          });
+          console.log(`   ✅ PR description updated`);
+        }
+
+        totalTokens += enhanceResponse.usage?.total || 0;
+      } catch (error) {
+        console.log(`   ⚠️  Enhancement failed: ${(error as Error).message}`);
+      }
+    }
+
+    // Build final result
+    const result: ReviewResult = {
+      prId: request.pullRequestId!,
+      decision,
+      statistics: {
+        filesReviewed: filesToReview.length,
+        issuesFound: severityCounts,
+        requirementCoverage: 0,
+        codeQualityScore: 0,
+        toolCallsMade: fileResults.reduce((sum, r) => sum + r.toolCallsMade, 0),
+        cacheHits: 0,
+        totalComments: allIssues.length,
+      },
+      summary: this.generateSummary(allIssues, decision),
+      duration: Math.round((Date.now() - startTime) / 1000),
+      tokenUsage: {
+        input: fileResults.reduce((sum, r) => sum + r.tokensUsed.input, 0),
+        output: fileResults.reduce((sum, r) => sum + r.tokensUsed.output, 0),
+        total: totalTokens,
+      },
+      costEstimate: this.calculateCostFromTokens(totalTokens),
+      sessionId: `explicit-loop-${request.pullRequestId}-${Date.now()}`,
+      reportPath,
+      enhancedDescription,
+      descriptionEnhanced: !!enhancedDescription,
+    };
+
+    this.logReviewComplete(result);
+
+    return result;
+  }
+
+  /**
+   * Review a single file with controlled context
+   * Uses FRESH NeuroLink session per file (no context carry-over)
+   * Implements chunking for large files that exceed token limits
+   */
+  private async reviewSingleFile(
+    context: FileReviewContext,
+    sessionKnowledge?: string | null,
+    featureContext?: string,
+  ): Promise<FileReviewResult> {
+    const fileStartTime = Date.now();
+    const maxTokens = this.config.explicitLoop?.maxTokensPerFile || 50000;
+
+    // Create FRESH session for this file (bounded context)
+    const fileSessionId = `${context.pullRequestId}-${context.filePath.replace(/[^a-zA-Z0-9]/g, "-")}-${Date.now()}`;
+
+    // Set tool context so MCP tools have default workspace/repository
+    (this.neurolink as any).setToolContext({
+      sessionId: fileSessionId,
+      workspace: context.workspace,
+      repository: context.repository,
+      pullRequestId: context.pullRequestId,
+      dryRun: true,
+    });
+
+    // Check if file needs chunking
+    const fullPrompt = this.promptBuilder.buildFileReviewPrompt(
+      context,
+      this.config,
+      {
+        sessionKnowledge: sessionKnowledge || undefined,
+        featureContext: featureContext || undefined,
+      },
+    );
+    const estimatedTokens = this.estimateTokenCount(fullPrompt);
+
+    if (estimatedTokens <= maxTokens) {
+      // File fits in single review - normal flow
+      return this.reviewFileChunk(
+        context,
+        fileSessionId,
+        fileStartTime,
+        undefined,
+        sessionKnowledge,
+        featureContext,
+      );
+    }
+
+    // File is large - split into chunks and review each
+    return this.reviewFileInChunks(
+      context,
+      fileSessionId,
+      fileStartTime,
+      maxTokens,
+      sessionKnowledge,
+      featureContext,
+    );
+  }
+
+  /**
+   * Review a file that fits within token limits
+   */
+  private async reviewFileChunk(
+    context: FileReviewContext,
+    sessionId: string,
+    startTime: number,
+    chunkInfo?: { current: number; total: number },
+    sessionKnowledge?: string | null,
+    featureContext?: string,
+  ): Promise<FileReviewResult> {
+    const prompt = this.promptBuilder.buildFileReviewPrompt(
+      context,
+      this.config,
+      {
+        chunkInfo,
+        sessionKnowledge: sessionKnowledge || undefined,
+        featureContext: featureContext || undefined,
+      },
+    );
+
+    try {
+      const response = await this.neurolink.generate({
+        input: { text: prompt },
+        provider: this.config.ai.provider,
+        model: this.config.ai.model,
+        temperature: this.config.ai.temperature,
+        maxTokens: this.config.ai.maxTokens,
+        context: {
+          sessionId,
+          userId: `file-review-${context.pullRequestId}`,
+          operation: "file-review",
+        },
+      });
+
+      // Parse JSON response
+      const responseText = response.content || "";
+      const findings = this.parseFileReviewResponse(responseText);
+
+      // Add file path to each issue
+      for (const issue of findings.issues) {
+        issue.filePath = context.filePath;
+      }
+
+      return {
+        filePath: context.filePath,
+        issues: findings.issues,
+        toolCallsMade: response.toolCalls?.length || 0,
+        tokensUsed: {
+          input: response.usage?.input || 0,
+          output: response.usage?.output || 0,
+          total: response.usage?.total || 0,
+        },
+        duration: Date.now() - startTime,
+      };
+    } catch (error) {
+      return {
+        filePath: context.filePath,
+        issues: [],
+        toolCallsMade: 0,
+        tokensUsed: { input: 0, output: 0, total: 0 },
+        duration: Date.now() - startTime,
+        error: (error as Error).message,
+      };
+    }
+  }
+
+  /**
+   * Review a large file in multiple chunks
+   */
+  private async reviewFileInChunks(
+    context: FileReviewContext,
+    baseSessionId: string,
+    startTime: number,
+    maxTokens: number,
+    sessionKnowledge?: string | null,
+    featureContext?: string,
+  ): Promise<FileReviewResult> {
+    console.log(`      📦 File exceeds token limit, reviewing in chunks...`);
+
+    // Split diff into chunks
+    const chunks = this.splitDiffIntoChunks(context.diff, maxTokens);
+    const allIssues: ReviewIssue[] = [];
+    let totalTokens = 0;
+    let totalToolCalls = 0;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkContext: FileReviewContext = {
+        ...context,
+        diff: chunks[i],
+      };
+
+      const chunkSessionId = `${baseSessionId}-chunk-${i + 1}`;
+
+      // Update tool context for this chunk's session
+      (this.neurolink as any).setToolContext({
+        sessionId: chunkSessionId,
+        workspace: context.workspace,
+        repository: context.repository,
+        pullRequestId: context.pullRequestId,
+        dryRun: true,
+      });
+
+      const result = await this.reviewFileChunk(
+        chunkContext,
+        chunkSessionId,
+        startTime,
+        { current: i + 1, total: chunks.length },
+        sessionKnowledge,
+        featureContext,
+      );
+
+      if (result.error) {
+        console.log(
+          `      ⚠️  Chunk ${i + 1}/${chunks.length} error: ${result.error}`,
+        );
+      } else {
+        allIssues.push(...result.issues);
+        totalTokens += result.tokensUsed.total;
+        totalToolCalls += result.toolCallsMade;
+
+        console.log(
+          `      📄 Chunk ${i + 1}/${chunks.length}: ${result.issues.length} issues | ${result.tokensUsed.total.toLocaleString()} tokens`,
+        );
+      }
+    }
+
+    return {
+      filePath: context.filePath,
+      issues: allIssues,
+      toolCallsMade: totalToolCalls,
+      tokensUsed: { input: 0, output: 0, total: totalTokens },
+      duration: Date.now() - startTime,
+      chunked: true,
+      totalChunks: chunks.length,
+    };
+  }
+
+  /**
+   * Split a diff into chunks that fit within token limits
+   */
+  private splitDiffIntoChunks(diff: DiffFile, maxTokens: number): DiffFile[] {
+    const chunks: DiffFile[] = [];
+    let currentChunk: DiffHunk[] = [];
+    let currentTokens = 0;
+    // Reserve 30% of tokens for prompt overhead (system prompt, context, etc.)
+    const maxDiffTokens = maxTokens * 0.7;
+
+    for (const hunk of diff.hunks) {
+      const hunkTokens = this.estimateHunkTokens(hunk);
+
+      if (
+        currentTokens + hunkTokens > maxDiffTokens &&
+        currentChunk.length > 0
+      ) {
+        // Current chunk is full, save it and start new one
+        chunks.push({ ...diff, hunks: currentChunk });
+        currentChunk = [];
+        currentTokens = 0;
+      }
+
+      currentChunk.push(hunk);
+      currentTokens += hunkTokens;
+    }
+
+    // Don't forget the last chunk
+    if (currentChunk.length > 0) {
+      chunks.push({ ...diff, hunks: currentChunk });
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Estimate token count for text
+   * Uses simple heuristic: ~4 characters per token
+   */
+  private estimateTokenCount(text: string): number {
+    return Math.ceil(text.length / 4);
+  }
+
+  /**
+   * Estimate token count for a diff hunk
+   */
+  private estimateHunkTokens(hunk: DiffHunk): number {
+    const linesTokens = hunk.lines.reduce(
+      (sum, line) => sum + Math.ceil((line.content.length + 20) / 4),
+      0,
+    );
+    return linesTokens + 50; // Add overhead for hunk header
+  }
+
+  /**
+   * Parse file review response to extract issues
+   */
+  private parseFileReviewResponse(responseText: string): {
+    issues: ReviewIssue[];
+  } {
+    try {
+      // Try to extract JSON from code block
+      const jsonMatch = responseText.match(/```json\s*([\s\S]*?)\s*```/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[1].trim());
+      }
+
+      // Try to parse as direct JSON
+      const jsonStart = responseText.indexOf("{");
+      const jsonEnd = responseText.lastIndexOf("}");
+      if (jsonStart !== -1 && jsonEnd !== -1) {
+        const jsonStr = responseText.slice(jsonStart, jsonEnd + 1);
+        return JSON.parse(jsonStr);
+      }
+
+      return { issues: [] };
+    } catch {
+      return { issues: [] };
+    }
+  }
+
+  /**
+   * Aggregate issues from all file results
+   */
+  private aggregateIssues(fileResults: FileReviewResult[]): ReviewIssue[] {
+    return fileResults.flatMap((r) => r.issues);
+  }
+
+  /**
+   * Make final decision based on aggregated issues
+   */
+  private makeFinalDecision(issues: ReviewIssue[]): ReviewDecision {
+    const critical = issues.filter((i) => i.severity === "CRITICAL").length;
+    const major = issues.filter((i) => i.severity === "MAJOR").length;
+
+    // Apply blocking criteria
+    if (critical > 0) {
+      return "BLOCKED";
+    }
+    if (major >= 3) {
+      return "CHANGES_REQUESTED";
+    }
+    if (major > 0) {
+      return "CHANGES_REQUESTED";
+    }
+    return "APPROVED";
+  }
+
+  /**
+   * Get severity counts from issues
+   */
+  private getSeverityCounts(issues: ReviewIssue[]): IssuesBySeverity {
+    return {
+      critical: issues.filter((i) => i.severity === "CRITICAL").length,
+      major: issues.filter((i) => i.severity === "MAJOR").length,
+      minor: issues.filter((i) => i.severity === "MINOR").length,
+      suggestions: issues.filter((i) => i.severity === "SUGGESTION").length,
+    };
+  }
+
+  /**
+   * Display per-file result
+   */
+  private displayFileResult(result: FileReviewResult): void {
+    if (result.error) {
+      console.log(`      ⚠️  Error: ${result.error}`);
+      return;
+    }
+
+    const issueCount = result.issues.length;
+    const tokenCount = result.tokensUsed.total;
+
+    if (issueCount === 0) {
+      console.log(
+        `      ✅ No issues | ${tokenCount.toLocaleString()} tokens | ${result.duration}ms`,
+      );
+    } else {
+      const severityBreakdown = this.getSeverityBreakdown(result.issues);
+      console.log(
+        `      ✅ Found ${issueCount} issues (${severityBreakdown}) | ${tokenCount.toLocaleString()} tokens | ${result.duration}ms`,
+      );
+    }
+  }
+
+  /**
+   * Get severity breakdown string for display
+   */
+  private getSeverityBreakdown(issues: ReviewIssue[]): string {
+    const counts = this.getSeverityCounts(issues);
+    const parts: string[] = [];
+    if (counts.critical > 0) {
+      parts.push(`${counts.critical} CRITICAL`);
+    }
+    if (counts.major > 0) {
+      parts.push(`${counts.major} MAJOR`);
+    }
+    if (counts.minor > 0) {
+      parts.push(`${counts.minor} MINOR`);
+    }
+    if (counts.suggestions > 0) {
+      parts.push(`${counts.suggestions} SUGGESTION`);
+    }
+    return parts.join(", ") || "0 issues";
+  }
+
+  /**
+   * Post all comments to Bitbucket
+   */
+  private async postAllComments(
+    issues: ReviewIssue[],
+    request: ReviewRequest,
+  ): Promise<void> {
+    for (const issue of issues) {
+      try {
+        await this.neurolink.executeTool("add_comment", {
+          workspace: request.workspace,
+          repository: request.repository,
+          pull_request_id: request.pullRequestId,
+          comment_text: this.formatCommentFromIssue(issue),
+          file_path: issue.filePath,
+          line_number: issue.lineNumber,
+          line_type: issue.lineType,
+          suggestion: issue.suggestion,
+        });
+      } catch (error) {
+        console.log(
+          `   ⚠️  Failed to post comment on ${issue.filePath}:${issue.lineNumber}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Format a comment from an issue
+   */
+  private formatCommentFromIssue(issue: ReviewIssue): string {
+    const emoji = {
+      CRITICAL: "🔒",
+      MAJOR: "⚠️",
+      MINOR: "💡",
+      SUGGESTION: "💬",
+    }[issue.severity];
+
+    let comment = `${emoji} **${issue.severity}**: ${issue.title}\n\n`;
+    comment += `**Issue**: ${issue.description}\n\n`;
+    comment += `**Impact**: ${issue.impact}`;
+
+    if (issue.suggestion) {
+      comment += `\n\n**Fix**:\n\`\`\`\n${issue.suggestion}\n\`\`\``;
+    }
+
+    if (issue.reference) {
+      comment += `\n\n**Reference**: ${issue.reference}`;
+    }
+
+    return comment;
+  }
+
+  /**
+   * Post decision to Bitbucket
+   */
+  private async postDecision(
+    decision: ReviewDecision,
+    request: ReviewRequest,
+    prDetails: PrefetchedPRData["prDetails"],
+  ): Promise<void> {
+    const summary = this.generateSummaryForPR(decision, prDetails);
+
+    if (decision === "APPROVED") {
+      await this.neurolink.executeTool("approve_pull_request", {
+        workspace: request.workspace,
+        repository: request.repository,
+        pull_request_id: request.pullRequestId,
+        message: summary,
+      });
+    } else {
+      await this.neurolink.executeTool("request_changes", {
+        workspace: request.workspace,
+        repository: request.repository,
+        pull_request_id: request.pullRequestId,
+        message: summary,
+      });
+    }
+  }
+
+  /**
+   * Generate summary text for the PR
+   */
+  private generateSummaryForPR(
+    decision: ReviewDecision,
+    _prDetails: PrefetchedPRData["prDetails"],
+  ): string {
+    const decisionEmoji =
+      decision === "APPROVED"
+        ? "✅"
+        : decision === "CHANGES_REQUESTED"
+          ? "⚠️"
+          : "🚫";
+
+    return `## 🤖 Yama Review Summary
+
+**Decision**: ${decisionEmoji} ${decision}
+
+_Review powered by Yama V2 (Explicit Loop Architecture)_`;
+  }
+
+  /**
+   * Generate summary text
+   */
+  private generateSummary(
+    issues: ReviewIssue[],
+    decision: ReviewDecision,
+  ): string {
+    const severityCounts = this.getSeverityCounts(issues);
+    return `Found ${issues.length} issues (${severityCounts.critical} CRITICAL, ${severityCounts.major} MAJOR, ${severityCounts.minor} MINOR, ${severityCounts.suggestions} SUGGESTIONS). Decision: ${decision}`;
+  }
+
+  /**
+   * Calculate cost from total tokens
+   */
+  private calculateCostFromTokens(totalTokens: number): number {
+    // Rough estimates (same as existing method)
+    const inputCostPer1M = 0.25;
+    const outputCostPer1M = 1.0;
+    // Assume 70% input, 30% output split
+    const inputTokens = totalTokens * 0.7;
+    const outputTokens = totalTokens * 0.3;
+    return Number(
+      (
+        (inputTokens / 1_000_000) * inputCostPer1M +
+        (outputTokens / 1_000_000) * outputCostPer1M
+      ).toFixed(4),
+    );
+  }
+
+  /**
+   * Build empty result for no files to review
+   */
+  private buildEmptyResult(
+    startTime: number,
+    request: ReviewRequest,
+  ): ReviewResult {
+    return {
+      prId: request.pullRequestId || 0,
+      decision: "APPROVED",
+      statistics: {
+        filesReviewed: 0,
+        issuesFound: { critical: 0, major: 0, minor: 0, suggestions: 0 },
+        requirementCoverage: 0,
+        codeQualityScore: 0,
+        toolCallsMade: 0,
+        cacheHits: 0,
+        totalComments: 0,
+      },
+      summary: "No files to review",
+      duration: Math.round((Date.now() - startTime) / 1000),
+      tokenUsage: { input: 0, output: 0, total: 0 },
+      costEstimate: 0,
+      sessionId: `explicit-loop-empty-${Date.now()}`,
+    };
   }
 }
 

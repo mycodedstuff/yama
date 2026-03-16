@@ -66,6 +66,10 @@ function setupReviewCommand(): void {
     .option("-p, --pr <id>", "Pull request ID")
     .option("-b, --branch <branch>", "Branch name (finds PR automatically)")
     .option("--review-only", "Skip description enhancement, only review code")
+    .option(
+      "--explicit-loop",
+      "Use explicit loop architecture (bounded context per file)",
+    )
     .option("--report", "Generate report file instead of posting comments")
     .option("--report-format <format>", "Report format (md|json)", "md")
     .option(
@@ -130,14 +134,29 @@ function setupReviewCommand(): void {
         // Start review (with or without description enhancement)
         console.log("🚀 Starting autonomous AI review...\n");
 
+        // Decision logic for explicit loop vs AI-driven:
+        // --explicit-loop flag: Use explicit loop methods (bounded context per file)
+        // Otherwise: Use existing AI-driven methods (single session, may hit token limits on large PRs)
+        const useExplicitLoop = options.explicitLoop;
+
+        if (useExplicitLoop) {
+          console.log(
+            "📋 Using Explicit Loop Architecture (bounded context per file)\n",
+          );
+        }
+
         // Decision logic:
-        // --review-only: Skip enhancement entirely (call startReview)
-        // --report only: Run enhancement but output to report (call startReviewAndEnhance)
-        // --report --review-only: Report without enhancement (call startReview)
-        // Neither: Normal mode with PR update (call startReviewAndEnhance)
-        const result = options.reviewOnly
-          ? await yama.startReview(request)
-          : await yama.startReviewAndEnhance(request);
+        // --review-only: Skip enhancement entirely (call startReview*)
+        // --report only: Run enhancement but output to report (call startReviewAndEnhance*)
+        // --report --review-only: Report without enhancement (call startReview*)
+        // Neither: Normal mode with PR update (call startReviewAndEnhance*)
+        const result = useExplicitLoop
+          ? options.reviewOnly
+            ? await yama.startReviewExplicitLoop(request)
+            : await yama.startReviewAndEnhanceExplicitLoop(request)
+          : options.reviewOnly
+            ? await yama.startReview(request)
+            : await yama.startReviewAndEnhance(request);
 
         // Show results
         console.log("\n📊 Review Results:");

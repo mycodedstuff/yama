@@ -9,6 +9,11 @@
 import { writeFile, mkdir, readFile } from "fs/promises";
 import { dirname } from "path";
 import { ReportFormat } from "../types/report.types.js";
+import {
+  ReviewIssue,
+  FileReviewTarget,
+  ReviewDecision,
+} from "../types/explicit-loop.types.js";
 
 export class ReportGenerator {
   /**
@@ -135,6 +140,351 @@ The following is an AI-generated enhanced PR description based on the code chang
 
 ${enhancedDescription}
 `;
+  }
+
+  // ============================================================================
+  // Explicit Loop Architecture Methods
+  // ============================================================================
+
+  /**
+   * Build report content from aggregated file review findings
+   * Used by explicit loop mode to generate report without AI generating it
+   */
+  buildReportFromFindings(params: {
+    prDetails: {
+      id: number;
+      title: string;
+      description: string;
+      author: { name: string; displayName: string };
+      state: string;
+      source: { branch: { name: string } };
+      destination: { branch: { name: string } };
+      createdDate: string;
+      updatedDate: string;
+    };
+    filesReviewed: FileReviewTarget[];
+    allIssues: ReviewIssue[];
+    decision: ReviewDecision;
+    format: "md" | "json";
+    workspace: string;
+    repository: string;
+    duration: number;
+    totalTokens: number;
+  }): string {
+    const { prDetails, filesReviewed, allIssues, decision, format } = params;
+
+    if (format === "json") {
+      return this.buildJSONReport(params);
+    }
+    return this.buildMarkdownReport(params);
+  }
+
+  /**
+   * Build markdown report from findings
+   */
+  private buildMarkdownReport(params: {
+    prDetails: {
+      id: number;
+      title: string;
+      description: string;
+      author: { name: string; displayName: string };
+      state: string;
+      source: { branch: { name: string } };
+      destination: { branch: { name: string } };
+      createdDate: string;
+      updatedDate: string;
+    };
+    filesReviewed: FileReviewTarget[];
+    allIssues: ReviewIssue[];
+    decision: ReviewDecision;
+    workspace: string;
+    repository: string;
+    duration: number;
+    totalTokens: number;
+  }): string {
+    const {
+      prDetails,
+      filesReviewed,
+      allIssues,
+      decision,
+      workspace,
+      repository,
+      duration,
+      totalTokens,
+    } = params;
+
+    const criticalIssues = allIssues.filter((i) => i.severity === "CRITICAL");
+    const majorIssues = allIssues.filter((i) => i.severity === "MAJOR");
+    const minorIssues = allIssues.filter((i) => i.severity === "MINOR");
+    const suggestions = allIssues.filter((i) => i.severity === "SUGGESTION");
+
+    const decisionEmoji =
+      decision === "APPROVED"
+        ? "✅"
+        : decision === "CHANGES_REQUESTED"
+          ? "⚠️"
+          : "🚫";
+
+    const durationSeconds = Math.round(duration / 1000);
+    const durationStr =
+      durationSeconds >= 60
+        ? `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`
+        : `${durationSeconds}s`;
+
+    return `# Code Review Report
+
+**PR**: #${prDetails.id} - ${prDetails.title}
+**Repository**: ${workspace}/${repository}
+**Author**: ${prDetails.author.displayName} (@${prDetails.author.name})
+**Branches**: ${prDetails.source.branch.name} → ${prDetails.destination.branch.name}
+**Reviewed**: ${new Date().toISOString().slice(0, 16).replace("T", " ")}
+**Decision**: ${decisionEmoji} ${decision}
+
+## Summary
+
+This PR modifies ${filesReviewed.length} files. ${this.generateSummaryText(allIssues, decision)}
+
+## Issues Found
+
+${
+  criticalIssues.length > 0
+    ? `### 🔒 CRITICAL (${criticalIssues.length})
+${this.formatIssuesSection(criticalIssues)}
+`
+    : ""
+}
+
+${
+  majorIssues.length > 0
+    ? `### ⚠️ MAJOR (${majorIssues.length})
+${this.formatIssuesSection(majorIssues)}
+`
+    : ""
+}
+
+${
+  minorIssues.length > 0
+    ? `### 💡 MINOR (${minorIssues.length})
+${this.formatIssuesSection(minorIssues)}
+`
+    : ""
+}
+
+${
+  suggestions.length > 0
+    ? `### 💬 SUGGESTIONS (${suggestions.length})
+${this.formatIssuesSection(suggestions)}
+`
+    : ""
+}
+
+${
+  allIssues.length === 0
+    ? `### ✅ No Issues Found
+
+All files reviewed with no significant issues detected.
+`
+    : ""
+}
+
+## Statistics
+
+| Metric | Value |
+|--------|-------|
+| Files Reviewed | ${filesReviewed.length} |
+| 🔒 Critical | ${criticalIssues.length} |
+| ⚠️ Major | ${majorIssues.length} |
+| 💡 Minor | ${minorIssues.length} |
+| 💬 Suggestions | ${suggestions.length} |
+| Duration | ${durationStr} |
+| Tokens Used | ${totalTokens.toLocaleString()} |
+
+## Files Changed
+
+${this.formatFilesList(filesReviewed)}
+
+---
+*Review powered by Yama V2 (Explicit Loop Architecture)*
+`;
+  }
+
+  /**
+   * Build JSON report from findings
+   */
+  private buildJSONReport(params: {
+    prDetails: {
+      id: number;
+      title: string;
+      description: string;
+      author: { name: string; displayName: string };
+      state: string;
+      source: { branch: { name: string } };
+      destination: { branch: { name: string } };
+      createdDate: string;
+      updatedDate: string;
+    };
+    filesReviewed: FileReviewTarget[];
+    allIssues: ReviewIssue[];
+    decision: ReviewDecision;
+    workspace: string;
+    repository: string;
+    duration: number;
+    totalTokens: number;
+  }): string {
+    const {
+      prDetails,
+      filesReviewed,
+      allIssues,
+      decision,
+      workspace,
+      repository,
+      duration,
+      totalTokens,
+    } = params;
+
+    const criticalIssues = allIssues.filter((i) => i.severity === "CRITICAL");
+    const majorIssues = allIssues.filter((i) => i.severity === "MAJOR");
+    const minorIssues = allIssues.filter((i) => i.severity === "MINOR");
+    const suggestions = allIssues.filter((i) => i.severity === "SUGGESTION");
+
+    const report = {
+      pr: {
+        id: prDetails.id,
+        title: prDetails.title,
+        description: prDetails.description,
+        author: prDetails.author,
+        state: prDetails.state,
+        sourceBranch: prDetails.source.branch.name,
+        targetBranch: prDetails.destination.branch.name,
+        createdDate: prDetails.createdDate,
+        updatedDate: prDetails.updatedDate,
+      },
+      repository: {
+        workspace,
+        name: repository,
+        fullName: `${workspace}/${repository}`,
+      },
+      review: {
+        decision,
+        reviewedAt: new Date().toISOString(),
+        duration: {
+          milliseconds: duration,
+          formatted: this.formatDuration(duration),
+        },
+        tokensUsed: totalTokens,
+      },
+      statistics: {
+        filesReviewed: filesReviewed.length,
+        issues: {
+          critical: criticalIssues.length,
+          major: majorIssues.length,
+          minor: minorIssues.length,
+          suggestions: suggestions.length,
+          total: allIssues.length,
+        },
+      },
+      issues: {
+        critical: criticalIssues,
+        major: majorIssues,
+        minor: minorIssues,
+        suggestions: suggestions,
+      },
+      files: filesReviewed,
+    };
+
+    return JSON.stringify(report, null, 2);
+  }
+
+  /**
+   * Generate summary text based on issues and decision
+   */
+  private generateSummaryText(
+    issues: ReviewIssue[],
+    decision: ReviewDecision,
+  ): string {
+    const critical = issues.filter((i) => i.severity === "CRITICAL").length;
+    const major = issues.filter((i) => i.severity === "MAJOR").length;
+    const minor = issues.filter((i) => i.severity === "MINOR").length;
+
+    if (decision === "BLOCKED") {
+      return `The PR is **BLOCKED** due to ${critical} critical issue${critical > 1 ? "s" : ""} that must be addressed before merging.`;
+    }
+
+    if (decision === "CHANGES_REQUESTED") {
+      if (critical > 0) {
+        return `Changes requested due to ${critical} critical and ${major} major issue${major !== 1 ? "s" : ""}.`;
+      }
+      return `Changes requested due to ${major} major issue${major > 1 ? "s" : ""} and ${minor} minor issue${minor !== 1 ? "s" : ""}.`;
+    }
+
+    if (issues.length === 0) {
+      return "No issues found. The PR is ready to merge.";
+    }
+
+    return `Found ${minor} minor issue${minor !== 1 ? "s" : ""} and ${issues.filter((i) => i.severity === "SUGGESTION").length} suggestion${issues.filter((i) => i.severity === "SUGGESTION").length !== 1 ? "s" : ""}. The PR is approved.`;
+  }
+
+  /**
+   * Format issues section for markdown report
+   */
+  private formatIssuesSection(issues: ReviewIssue[]): string {
+    return issues
+      .map((issue, idx) => {
+        const filePath = issue.filePath || "unknown";
+        return `
+#### ${idx + 1}. \`${filePath}:${issue.lineNumber}\`
+
+**${issue.severity}**: ${issue.title}
+
+**Issue**: ${issue.description}
+
+**Impact**: ${issue.impact}
+
+${
+  issue.suggestion
+    ? `**Fix**:
+\`\`\`
+${issue.suggestion}
+\`\`\`
+`
+    : ""
+}
+
+${issue.reference ? `**Reference**: ${issue.reference}` : ""}
+`;
+      })
+      .join("\n");
+  }
+
+  /**
+   * Format files list for markdown report
+   */
+  private formatFilesList(files: FileReviewTarget[]): string {
+    const statusEmoji: Record<string, string> = {
+      added: "➕",
+      modified: "📝",
+      deleted: "➖",
+      renamed: "📦",
+    };
+
+    return files
+      .map(
+        (f) => `- ${statusEmoji[f.status] || "📄"} \`${f.path}\` (${f.status})`,
+      )
+      .join("\n");
+  }
+
+  /**
+   * Format duration in human-readable format
+   */
+  private formatDuration(ms: number): string {
+    const seconds = Math.round(ms / 1000);
+    if (seconds >= 60) {
+      const minutes = Math.floor(seconds / 60);
+      const remainingSeconds = seconds % 60;
+      return `${minutes}m ${remainingSeconds}s`;
+    }
+    return `${seconds}s`;
   }
 }
 

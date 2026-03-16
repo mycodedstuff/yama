@@ -194,6 +194,13 @@ export class DefaultConfig {
           warningThreshold: 1.5,
         },
       },
+
+      explicitLoop: {
+        enabled: true,
+        fileThreshold: 20,
+        maxTokensPerFile: 50000,
+        fileTimeoutMs: 120000, // 2 minutes
+      },
     };
   }
 }

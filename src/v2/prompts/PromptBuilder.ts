@@ -17,6 +17,14 @@ import {
   getReportModeSystemPrompt,
   getReportModeEnhancementPrompt,
 } from "./ReportModeSystemPrompt.js";
+import { getFileReviewSystemPrompt } from "./FileReviewSystemPrompt.js";
+import {
+  FileReviewContext,
+  ReviewIssue,
+  FileReviewTarget,
+  FeatureContext,
+} from "../types/explicit-loop.types.js";
+import { DiffHunk, DiffLine } from "../types/mcp.types.js";
 
 export class PromptBuilder {
   private langfuseManager: LangfusePromptManager;
@@ -381,6 +389,280 @@ ${requiredSectionsXML}
     <preserve-content>${config.descriptionEnhancement.preserveContent}</preserve-content>
     <auto-format>${config.descriptionEnhancement.autoFormat}</auto-format>
   </settings>
+    `.trim();
+  }
+
+  // ============================================================================
+  // Explicit Loop Architecture Methods
+  // ============================================================================
+
+  /**
+   * Build focused prompt for single file review
+   * Much smaller than full review prompt - bounded context per file
+   */
+  buildFileReviewPrompt(
+    context: FileReviewContext,
+    config: YamaV2Config,
+    options?: {
+      chunkInfo?: { current: number; total: number };
+      /** Session knowledge base context for deduplication */
+      sessionKnowledge?: string;
+      /** Feature context - what the PR is trying to accomplish */
+      featureContext?: string;
+    },
+  ): string {
+    const basePrompt = getFileReviewSystemPrompt();
+
+    // Build chunk notice if this is part of a chunked review
+    let chunkNotice = "";
+    if (options?.chunkInfo) {
+      chunkNotice = `
+<chunk-context>
+  This is chunk ${options.chunkInfo.current} of ${options.chunkInfo.total} for this file.
+  Focus on issues in this portion of the diff. All chunks will be reviewed to cover the entire file.
+
+  <surrounding-context-tool>
+    Since you only see a portion of the file, you may need context from other parts.
+    Use search_code to briefly gather information about surrounding code when needed:
+
+    - Search for function/method definitions referenced in this chunk
+    - Search for variable declarations or type definitions used here
+    - Search for related code patterns that provide context
+
+    IMPORTANT: Keep searches brief and focused. Only gather what's necessary for
+    understanding the code in this chunk. Avoid redundant searches.
+  </surrounding-context-tool>
+</chunk-context>`;
+    }
+
+    // Session knowledge base context (for deduplication and cross-file awareness)
+    const knowledgeSection = options?.sessionKnowledge
+      ? `\n${options.sessionKnowledge}\n`
+      : "";
+
+    // Feature context section (purpose, domain concepts, technical approach)
+    const featureContextSection = options?.featureContext
+      ? `\n${options.featureContext}\n`
+      : "";
+
+    return `
+${basePrompt}
+
+${featureContextSection}<pr-context>
+  <workspace>${this.escapeXML(context.workspace)}</workspace>
+  <repository>${this.escapeXML(context.repository)}</repository>
+  <id>${context.pullRequestId}</id>
+  <title>${this.escapeXML(context.prTitle)}</title>
+  <source>${this.escapeXML(context.sourceBranch)}</source>
+  <target>${this.escapeXML(context.targetBranch)}</target>
+</pr-context>
+
+<file>
+  <path>${this.escapeXML(context.filePath)}</path>
+  <status>${context.fileStatus}</status>
+  <diff>
+${this.formatDiffForPrompt(context.diff)}
+  </diff>
+</file>
+
+<existing-comments>
+${this.formatExistingComments(context.existingComments)}
+</existing-comments>
+${knowledgeSection}
+<project-config>
+  ${this.buildFocusAreasXML(config)}
+  ${this.buildBlockingCriteriaXML(config)}
+</project-config>
+${chunkNotice}
+
+<instructions>
+  Analyze this file and return findings in JSON format.
+  Use search_code if you need to understand context.
+  DO NOT post comments - return findings only.
+
+  IMPORTANT: Before reporting an issue, check if it's already been reported
+  in the <already-reported> section above. Only report NEW issues that haven't
+  been found in previous files.
+</instructions>
+    `.trim();
+  }
+
+  /**
+   * Format diff for prompt inclusion
+   * Presents the diff in a readable format for the AI
+   */
+  private formatDiffForPrompt(diff: { hunks: DiffHunk[] }): string {
+    if (!diff || !diff.hunks || diff.hunks.length === 0) {
+      return "    (No diff content available)";
+    }
+
+    const lines: string[] = [];
+
+    for (const hunk of diff.hunks) {
+      for (const line of hunk.lines) {
+        const lineNum =
+          line.type === "REMOVED" ? line.source_line : line.destination_line;
+        const prefix =
+          line.type === "ADDED" ? "+" : line.type === "REMOVED" ? "-" : " ";
+        lines.push(
+          `    ${(lineNum ?? 0).toString().padStart(4)} ${prefix} ${line.content}`,
+        );
+      }
+      lines.push("    " + "─".repeat(60));
+    }
+
+    return lines.join("\n");
+  }
+
+  /**
+   * Format existing comments for duplicate detection
+   */
+  private formatExistingComments(
+    comments: {
+      text: string;
+      anchor?: { filePath: string; lineFrom: number };
+    }[],
+  ): string {
+    if (!comments || comments.length === 0) {
+      return "    (No existing comments on this file)";
+    }
+
+    return comments
+      .map(
+        (c) =>
+          `    Line ${c.anchor?.lineFrom || "?"}: ${this.escapeXML(c.text.substring(0, 100))}${c.text.length > 100 ? "..." : ""}`,
+      )
+      .join("\n");
+  }
+
+  /**
+   * Build focus areas XML for file review
+   */
+  private buildFocusAreasXML(config: YamaV2Config): string {
+    const focusAreasXML = config.review.focusAreas
+      .map(
+        (area) => `
+    <focus-area priority="${area.priority}">
+      <name>${this.escapeXML(area.name)}</name>
+      <description>${this.escapeXML(area.description)}</description>
+    </focus-area>`,
+      )
+      .join("\n");
+
+    return `
+  <focus-areas>
+${focusAreasXML}
+  </focus-areas>`;
+  }
+
+  /**
+   * Build blocking criteria XML for file review
+   */
+  private buildBlockingCriteriaXML(config: YamaV2Config): string {
+    if (
+      !config.review.blockingCriteria ||
+      config.review.blockingCriteria.length === 0
+    ) {
+      return "";
+    }
+
+    const blockingCriteriaXML = config.review.blockingCriteria
+      .map(
+        (criteria) => `
+    <criterion>
+      <condition>${this.escapeXML(criteria.condition)}</condition>
+      <action>${criteria.action}</action>
+      <reason>${this.escapeXML(criteria.reason)}</reason>
+    </criterion>`,
+      )
+      .join("\n");
+
+    return `
+  <blocking-criteria>
+${blockingCriteriaXML}
+  </blocking-criteria>`;
+  }
+
+  /**
+   * Build enhancement prompt with aggregated review findings
+   * Replaces context that would have been in shared session
+   */
+  buildEnhancementPromptWithFindings(params: {
+    prDetails: {
+      id: number;
+      title: string;
+      description: string;
+      source: { branch: { name: string } };
+      destination: { branch: { name: string } };
+    };
+    filesReviewed: FileReviewTarget[];
+    issuesFound: ReviewIssue[];
+    config: YamaV2Config;
+  }): string {
+    const basePrompt = `You are an expert at writing clear, comprehensive PR descriptions.
+
+Your task is to enhance the PR description based on the code changes and review findings.
+Follow the required sections and maintain a professional tone.`;
+
+    // Summarize files changed
+    const filesSummary = params.filesReviewed
+      .map((f) => `- ${f.path} (${f.status})`)
+      .join("\n");
+
+    // Summarize key issues (limit to avoid token bloat)
+    const keyIssues = params.issuesFound
+      .filter((i) => i.severity === "CRITICAL" || i.severity === "MAJOR")
+      .slice(0, 10)
+      .map((i) => `- ${i.title} in ${i.filePath}`)
+      .join("\n");
+
+    const requiredSectionsXML =
+      params.config.descriptionEnhancement.requiredSections
+        .map(
+          (section) => `
+    <section key="${section.key}" required="${section.required}">
+      <name>${this.escapeXML(section.name)}</name>
+      <description>${this.escapeXML(section.description)}</description>
+    </section>`,
+        )
+        .join("\n");
+
+    return `
+${basePrompt}
+
+<pr-context>
+  <title>${this.escapeXML(params.prDetails.title)}</title>
+  <original-description>
+${this.escapeXML(params.prDetails.description)}
+  </original-description>
+  <source>${this.escapeXML(params.prDetails.source.branch.name)}</source>
+  <target>${this.escapeXML(params.prDetails.destination.branch.name)}</target>
+</pr-context>
+
+<review-summary>
+  <files-changed>
+${filesSummary}
+  </files-changed>
+
+  <key-issues-found>
+${keyIssues || "No major issues found"}
+  </key-issues-found>
+</review-summary>
+
+<required-sections>
+${requiredSectionsXML}
+</required-sections>
+
+<enhancement-instructions>
+  ${this.escapeXML(params.config.descriptionEnhancement.instructions)}
+</enhancement-instructions>
+
+<output-instructions>
+  Return ONLY the enhanced description as markdown.
+  Do NOT wrap in code blocks.
+  Do NOT include meta-commentary.
+  Start directly with the first section.
+</output-instructions>
     `.trim();
   }
 }

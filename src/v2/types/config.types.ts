@@ -21,6 +21,7 @@ export interface YamaV2Config {
   projectStandards?: ProjectStandardsConfig;
   monitoring: MonitoringConfig;
   performance: PerformanceConfig;
+  explicitLoop: ExplicitLoopConfig;
 }
 
 // ============================================================================
@@ -199,4 +200,19 @@ export interface TokenBudgetConfig {
 export interface CostControlsConfig {
   maxCostPerReview: number;
   warningThreshold: number;
+}
+
+// ============================================================================
+// Explicit Loop Configuration
+// ============================================================================
+
+export interface ExplicitLoopConfig {
+  /** Enable explicit loop mode (bounded context per file) */
+  enabled: boolean;
+  /** Auto-enable when files exceed this threshold */
+  fileThreshold: number;
+  /** Maximum tokens per file review */
+  maxTokensPerFile: number;
+  /** Timeout per file review in milliseconds */
+  fileTimeoutMs: number;
 }
