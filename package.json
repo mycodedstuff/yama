@@ -48,7 +48,7 @@
     "docs/v2"
   ],
   "scripts": {
-    "build": "tsc && tsc-alias",
+    "build": "npx tsc && npx tsc-alias",
     "dev": "tsx watch src/cli/v2.cli.ts",
     "dev:run": "tsx src/cli/v2.cli.ts",
     "test": "jest",
