@@ -59,7 +59,7 @@
     "format:check": "prettier --check .",
     "docs": "typedoc src",
     "clean": "rimraf dist",
-    "prepare": "husky install",
+    "prepare": "npm run build && husky install",
     "prepack": "npm run build && npm run test",
     "changeset": "changeset",
     "changeset:version": "changeset version && git add --all",
@@ -154,6 +154,11 @@
     ],
     "overrides": {
       "@semantic-release/npm": "^13.1.2"
+    }
+  },
+  "dependenciesMeta": {
+    "husky": {
+      "optional": true
     }
   },
   "lint-staged": {
