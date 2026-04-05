@@ -8,29 +8,18 @@
 
 import { writeFile, mkdir, readFile } from "fs/promises";
 import { dirname } from "path";
-import { ReportFormat } from "../types/report.types.js";
 
 export class ReportGenerator {
   /**
    * Write AI response directly to file
-   * For markdown format: write the response as-is
-   * For JSON format: extract JSON from code block if present
    */
   async writeReportFromAIResponse(
     response: string,
-    format: ReportFormat,
     path: string,
   ): Promise<void> {
-    let content = response;
-
-    // For JSON format, extract JSON from markdown code block if present
-    if (format === "json") {
-      content = this.extractJSONContent(response);
-    }
-
     // Handle stdout
     if (path === "-") {
-      console.log(content);
+      console.log(response);
       return;
     }
 
@@ -39,41 +28,17 @@ export class ReportGenerator {
     await mkdir(dir, { recursive: true });
 
     // Write file (trim to remove leading/trailing whitespace from AI output)
-    await writeFile(path, content.trim(), "utf-8");
-  }
-
-  /**
-   * Extract JSON content from AI response
-   * If the response contains a ```json code block, extract just the JSON
-   * Otherwise, return the response as-is (assuming it's already JSON)
-   */
-  private extractJSONContent(response: string): string {
-    // Try to find JSON in code block
-    const jsonBlockMatch = response.match(/```json\s*([\s\S]*?)\s*```/);
-    if (jsonBlockMatch) {
-      return jsonBlockMatch[1].trim();
-    }
-
-    // Check if response is already valid JSON
-    try {
-      JSON.parse(response);
-      return response;
-    } catch {
-      // Not valid JSON, return as-is and let the caller handle it
-      return response;
-    }
+    await writeFile(path, response.trim(), "utf-8");
   }
 
   /**
    * Generate default report path
    * @param prId - Pull request ID
-   * @param format - Output format (md or json)
    * @param timestamp - Optional timestamp (defaults to now)
    * @param repository - Optional repository name for filename prefix
    */
   generateDefaultPath(
     prId: number | string,
-    format: ReportFormat,
     timestamp?: Date,
     repository?: string,
   ): string {
@@ -88,9 +53,8 @@ export class ReportGenerator {
     const second = String(ts.getSeconds()).padStart(2, "0");
     const tsStr = `${year}-${month}-${day}T${hour}-${minute}-${second}`;
 
-    const ext = format === "json" ? "json" : "md";
     const repoPrefix = repository ? `${repository}-` : "";
-    return `.yama/reports/${repoPrefix}pr-${prId}-${tsStr}.${ext}`;
+    return `.yama/reports/${repoPrefix}pr-${prId}-${tsStr}.md`;
   }
 
   /**

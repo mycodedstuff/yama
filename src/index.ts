@@ -51,7 +51,6 @@ export type {
 
 // Report types
 export type {
-  ReportFormat,
   IssueSeverity,
   LineType,
   ReviewIssue,

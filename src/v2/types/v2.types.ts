@@ -17,7 +17,6 @@ export interface ReviewRequest {
   configPath?: string;
   // Report mode options
   reportMode?: boolean;
-  reportFormat?: "md" | "json";
   reportPath?: string;
   // Review-only mode: skip description enhancement entirely
   reviewOnly?: boolean;

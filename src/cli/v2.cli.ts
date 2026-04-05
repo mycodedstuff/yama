@@ -67,7 +67,6 @@ function setupReviewCommand(): void {
     .option("-b, --branch <branch>", "Branch name (finds PR automatically)")
     .option("--review-only", "Skip description enhancement, only review code")
     .option("--report", "Generate report file instead of posting comments")
-    .option("--report-format <format>", "Report format (md|json)", "md")
     .option(
       "--report-path <path>",
       "Report output path (use '-' for stdout, default: .yama/reports/pr-{id}-{timestamp}.md)",
@@ -94,17 +93,6 @@ function setupReviewCommand(): void {
           }
         }
 
-        // Validate report format
-        if (
-          options.reportFormat &&
-          !["md", "json"].includes(options.reportFormat)
-        ) {
-          console.error(
-            `❌ Error: Invalid report format "${options.reportFormat}" (must be md or json)`,
-          );
-          process.exit(1);
-        }
-
         const request: ReviewRequest = {
           workspace: options.workspace,
           repository: options.repository,
@@ -114,7 +102,6 @@ function setupReviewCommand(): void {
           verbose: globalOpts.verbose || false,
           configPath: globalOpts.config,
           reportMode: options.report || false,
-          reportFormat: options.reportFormat || "md",
           reportPath: options.reportPath,
           reviewOnly: options.reviewOnly || false,
         };

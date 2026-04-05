@@ -330,7 +330,6 @@ describe("PromptBuilder", () => {
   describe("buildReviewInstructions - Report Mode", () => {
     it("should use report mode system prompt when reportMode is true", async () => {
       mockRequest.reportMode = true;
-      mockRequest.reportFormat = "md";
       const result = await builder.buildReviewInstructions(
         mockRequest,
         mockConfig,
@@ -365,7 +364,6 @@ describe("PromptBuilder", () => {
 
     it("should include report output format instructions in report mode", async () => {
       mockRequest.reportMode = true;
-      mockRequest.reportFormat = "md";
       const result = await builder.buildReviewInstructions(
         mockRequest,
         mockConfig,
@@ -374,20 +372,6 @@ describe("PromptBuilder", () => {
       // Should contain report format instructions
       expect(result).toContain("# Code Review Report");
       expect(result).toContain("## Issues Found");
-    });
-
-    it("should include JSON format instructions when reportFormat is json", async () => {
-      mockRequest.reportMode = true;
-      mockRequest.reportFormat = "json";
-      const result = await builder.buildReviewInstructions(
-        mockRequest,
-        mockConfig,
-      );
-
-      // Should contain JSON-specific format instructions
-      expect(result).toContain("```json");
-      expect(result).toContain('"decision"');
-      expect(result).toContain('"issues"');
     });
   });
 });

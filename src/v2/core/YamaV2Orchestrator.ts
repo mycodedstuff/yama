@@ -771,28 +771,21 @@ export class YamaV2Orchestrator {
     const responseText = aiResponse.content || aiResponse.text || "";
 
     // Determine output path
-    const format = request.reportFormat || "md";
     let reportPath = request.reportPath;
 
     if (!reportPath) {
       reportPath = this.reportGenerator.generateDefaultPath(
         request.pullRequestId || "unknown",
-        format,
         undefined, // timestamp (use current time)
         request.repository, // repository name for filename prefix
       );
     }
 
-    let reportContent = responseText;
-
-    if (format === "md") {
-      const metadataHeader = this.generateReportMetadataHeader(request);
-      reportContent = metadataHeader + responseText;
-    }
+    const metadataHeader = this.generateReportMetadataHeader(request);
+    const reportContent = metadataHeader + responseText;
 
     await this.reportGenerator.writeReportFromAIResponse(
       reportContent,
-      format,
       reportPath,
     );
 

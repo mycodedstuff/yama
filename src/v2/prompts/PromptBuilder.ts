@@ -37,7 +37,7 @@ export class PromptBuilder {
     // Use dedicated report mode system prompt when in report mode
     // This replaces the base prompt entirely to avoid conflicting instructions
     const basePrompt = request.reportMode
-      ? getReportModeSystemPrompt(request.reportFormat)
+      ? getReportModeSystemPrompt()
       : await this.langfuseManager.getReviewPrompt();
 
     // Project-specific configuration in XML format
