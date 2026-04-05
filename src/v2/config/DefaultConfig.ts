@@ -31,8 +31,21 @@ export class DefaultConfig {
           enabled: true,
           store: "memory",
           maxSessions: 50,
-          maxTurnsPerSession: 300,
-          enableSummarization: false,
+          enableSummarization: true,
+          contextCompaction: {
+            enabled: true,
+            threshold: 0.8,
+            enablePruning: false,
+            enableDeduplication: true,
+            enableSlidingWindow: true,
+            maxToolOutputBytes: 51200,
+            maxToolOutputLines: 2000,
+            sendToolPreview: true,
+            fileReadBudgetPercent: 0.6,
+          },
+          fileSummarization: {
+            enabled: false,
+          },
         },
       },
 

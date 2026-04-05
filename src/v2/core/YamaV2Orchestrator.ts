@@ -81,6 +81,8 @@ export class YamaV2Orchestrator {
 
       // Step 2: Initialize NeuroLink with observability
       console.log("🧠 Initializing NeuroLink AI engine...");
+      console.log(`   AI Provider: ${this.config.ai.provider}`);
+      console.log(`   AI Model: ${this.config.ai.model}`);
       this.neurolink = this.initializeNeurolink();
       console.log("✅ NeuroLink initialized\n");
 
@@ -781,9 +783,15 @@ export class YamaV2Orchestrator {
       );
     }
 
-    // Write the AI's output directly to file
+    let reportContent = responseText;
+
+    if (format === "md") {
+      const metadataHeader = this.generateReportMetadataHeader(request);
+      reportContent = metadataHeader + responseText;
+    }
+
     await this.reportGenerator.writeReportFromAIResponse(
-      responseText,
+      reportContent,
       format,
       reportPath,
     );
@@ -791,6 +799,23 @@ export class YamaV2Orchestrator {
     console.log(`\n📄 Report generated: ${reportPath}`);
 
     return reportPath;
+  }
+
+  private generateReportMetadataHeader(request: ReviewRequest): string {
+    const timestamp = new Date().toISOString();
+    const config = this.config.ai;
+
+    return `> **Review Metadata**
+> - **Generated**: ${timestamp}
+> - **AI Provider**: ${config.provider}
+> - **Model**: ${config.model}
+> - **Max Tokens**: ${config.maxTokens}
+> - **PR**: #${request.pullRequestId}
+> - **Repository**: ${request.workspace}/${request.repository}
+
+---
+
+`;
   }
 
   /**
@@ -855,6 +880,33 @@ export class YamaV2Orchestrator {
       }
 
       const neurolink = new NeuroLink(neurolinkConfig);
+
+      const memConfig = this.config.ai.conversationMemory;
+      if (memConfig?.enabled) {
+        const compaction = memConfig.contextCompaction;
+        console.log("   🗜️  Context compaction enabled:");
+        console.log(
+          `      - Summarization: ${memConfig.enableSummarization ? "enabled" : "disabled"}`,
+        );
+        if (compaction) {
+          console.log(
+            `      - Pruning: ${compaction.enablePruning ? "enabled" : "disabled"}`,
+          );
+          console.log(
+            `      - Preview mode: ${compaction.sendToolPreview ? "enabled" : "disabled"}`,
+          );
+          console.log(
+            `      - Deduplication: ${compaction.enableDeduplication ? "enabled" : "disabled"}`,
+          );
+          console.log(
+            `      - Sliding window: ${compaction.enableSlidingWindow ? "enabled" : "disabled"}`,
+          );
+          console.log(
+            `      - Threshold: ${((compaction.threshold || 0.8) * 100).toFixed(0)}% of context`,
+          );
+        }
+      }
+
       return neurolink;
     } catch (error) {
       console.error(
@@ -954,8 +1006,10 @@ export class YamaV2Orchestrator {
     }
     console.log("");
     console.log(
-      `   💰 Token Usage: ${result.tokenUsage.total.toLocaleString()}`,
+      `   💰 Token Usage: ${result.tokenUsage.total.toLocaleString()} total`,
     );
+    console.log(`      Input:  ${result.tokenUsage.input.toLocaleString()}`);
+    console.log(`      Output: ${result.tokenUsage.output.toLocaleString()}`);
     console.log(`   Cost Estimate: $${result.costEstimate.toFixed(4)}`);
     console.log("═".repeat(60) + "\n");
   }

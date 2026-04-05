@@ -53,10 +53,56 @@ export interface AIConfig {
 export interface ConversationMemoryConfig {
   enabled: boolean;
   store: "memory" | "redis";
-  maxSessions: number;
-  maxTurnsPerSession: number;
-  enableSummarization: boolean;
+  maxSessions?: number;
+  /** Enable automatic context summarization/compaction */
+  enableSummarization?: boolean;
+  /** Token threshold to trigger compaction (defaults to 80% of model context) */
+  tokenThreshold?: number;
+  /** Provider for summarization (defaults to vertex) */
+  summarizationProvider?: string;
+  /** Model for summarization (defaults to gemini-2.5-flash) */
+  summarizationModel?: string;
   redis?: RedisConfig;
+  /** Context compaction configuration */
+  contextCompaction?: ContextCompactionConfig;
+  /** File content summarization for large files */
+  fileSummarization?: FileSummarizationConfig;
+}
+
+export interface ContextCompactionConfig {
+  /** Enable auto-compaction (default: true when summarization enabled) */
+  enabled?: boolean;
+  /** Compaction trigger threshold (0.0-1.0, default: 0.80) */
+  threshold?: number;
+  /** Enable tool output pruning - replace old tool outputs with placeholder (default: true) */
+  enablePruning?: boolean;
+  /** Enable file read deduplication (default: true) */
+  enableDeduplication?: boolean;
+  /** Enable sliding window truncation as fallback (default: true) */
+  enableSlidingWindow?: boolean;
+  /** Max tool output size in bytes (default: 51200 = 50KB) */
+  maxToolOutputBytes?: number;
+  /** Max tool output lines (default: 2000) */
+  maxToolOutputLines?: number;
+  /** Return preview instead of full output; AI can retrieve full via retrieve_context tool (default: false) */
+  sendToolPreview?: boolean;
+  /** File read budget as fraction of remaining context (default: 0.60) */
+  fileReadBudgetPercent?: number;
+}
+
+export interface FileSummarizationConfig {
+  /** Enable automatic file content summarization */
+  enabled?: boolean;
+  /** Provider for file summarization */
+  provider?: string;
+  /** Model for file summarization */
+  model?: string;
+  /** Token threshold per file to trigger summarization */
+  threshold?: number;
+  /** Minimum tokens per file after summarization */
+  minTokensPerFile?: number;
+  /** Maximum tokens per file after summarization */
+  maxTokensPerFile?: number;
 }
 
 export interface RedisConfig {
